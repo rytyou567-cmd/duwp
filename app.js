@@ -163,10 +163,30 @@ async function setupConnection(conn) {
 
     conn.on('close', () => {
         activePeers.delete(peerId);
-        if (currentPeerId === peerId) currentPeerId = null;
         updatePeerList();
+
+        // Update UI if the disconnected peer is the currently active one
+        if (currentPeerId === peerId) {
+            document.getElementById('active-peer-status').textContent = 'Offline (Disconnected)';
+            document.getElementById('active-peer-status').style.color = 'var(--accent-red, #ff4444)';
+            document.getElementById('active-peer-name').style.color = 'var(--text-muted)';
+            const input = document.getElementById('message-input');
+            input.placeholder = 'Node offline...';
+            input.disabled = true;
+            document.getElementById('send-btn').disabled = true;
+
+            // If we are in a call with them, end it automatically
+            if (activeCallState.peerId === peerId) {
+                endCall();
+            }
+        }
+
         showToast(`${peerId} disconnected`, 'info');
     });
+}
+
+function openCallOverlay() {
+    document.getElementById('call-overlay').classList.add('active');
 }
 
 async function handleIncomingData(peerId, data) {
@@ -194,6 +214,14 @@ async function handleIncomingData(peerId, data) {
                 const text = await CryptoUtils.decryptChunk(data.payload, p.sharedKey, data.iv);
                 addMessage(peerId, peer.id, text, 'received');
             }
+            break;
+        case 'CALL_OFFER':
+        case 'CALL_RINGING':
+        case 'CALL_ACCEPT':
+        case 'CALL_REJECT':
+        case 'CALL_BUSY':
+        case 'CALL_END':
+            handleCallSignaling(peerId, data);
             break;
         case 'GROUP_INVITE':
             console.log('RECV: GROUP_INVITE', data);
@@ -935,7 +963,14 @@ function addMessage(from, to, text, type, groupId = null) {
     renderMessages();
 }
 
-// --- CALLING ---
+// --- CALLING (DIALER SYSTEM) ---
+let activeCallState = {
+    peerId: null,
+    status: 'idle', // 'idle', 'calling', 'ringing', 'active'
+    direction: null, // 'inbound', 'outbound'
+    isAudioOnly: true
+};
+
 async function startCall(video = true) {
     if (!currentPeerId) {
         showToast('Select a peer to call', 'warning');
@@ -947,45 +982,120 @@ async function startCall(video = true) {
         return;
     }
 
-    isAudioOnly = !video;
+    if (activeCallState.status !== 'idle') {
+        showToast('You are already in a call.', 'warning');
+        return;
+    }
 
+    activeCallState = {
+        peerId: currentPeerId,
+        status: 'calling',
+        direction: 'outbound',
+        isAudioOnly: !video
+    };
+
+    // Show Outgoing UI
+    document.getElementById('outgoing-target-avatar').textContent = (p.nickname || currentPeerId).charAt(0).toUpperCase();
+    document.getElementById('outgoing-target-name').textContent = p.nickname || currentPeerId;
+    document.getElementById('outgoing-call-status').textContent = `Calling...`;
+    document.getElementById('outgoing-call-overlay').classList.add('active');
+
+    // Send Offer Signal
+    p.conn.send({ type: 'CALL_OFFER', video });
+}
+
+function handleCallSignaling(peerId, data) {
+    const p = activePeers.get(peerId);
+    if (!p) return;
+
+    switch (data.type) {
+        case 'CALL_OFFER':
+            if (activeCallState.status !== 'idle') {
+                p.conn.send({ type: 'CALL_BUSY' });
+                return;
+            }
+            activeCallState = {
+                peerId: peerId,
+                status: 'ringing',
+                direction: 'inbound',
+                isAudioOnly: !data.video
+            };
+            // Send Ringing Signal
+            p.conn.send({ type: 'CALL_RINGING' });
+
+            // Show Incoming UI
+            document.getElementById('incoming-caller-avatar').textContent = (p.nickname || peerId).charAt(0).toUpperCase();
+            document.getElementById('incoming-caller-name').textContent = p.nickname || peerId;
+            document.getElementById('incoming-call-type').textContent = `Incoming ${data.video ? 'Video' : 'Audio'} Link...`;
+            document.getElementById('incoming-call-overlay').classList.add('active');
+            break;
+
+        case 'CALL_RINGING':
+            if (activeCallState.status === 'calling' && activeCallState.peerId === peerId) {
+                document.getElementById('outgoing-call-status').textContent = `Ringing...`;
+            }
+            break;
+
+        case 'CALL_ACCEPT':
+            if (activeCallState.status === 'calling' && activeCallState.peerId === peerId) {
+                activeCallState.status = 'active';
+                document.getElementById('outgoing-call-overlay').classList.remove('active');
+                initiateMediaStream(peerId, !activeCallState.isAudioOnly);
+            }
+            break;
+
+        case 'CALL_REJECT':
+        case 'CALL_BUSY':
+            if (activeCallState.peerId === peerId) {
+                showToast(data.type === 'CALL_BUSY' ? 'User is busy' : 'Call declined', 'error');
+                endCall();
+            }
+            break;
+
+        case 'CALL_END':
+            if (activeCallState.peerId === peerId) {
+                endCall();
+            }
+            break;
+    }
+}
+
+async function initiateMediaStream(targetPeerId, video) {
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({
-            video: video,
-            audio: true
-        });
-
+        localStream = await navigator.mediaDevices.getUserMedia({ video: video, audio: true });
         document.getElementById('local-video').srcObject = localStream;
         document.getElementById('local-video').style.display = video ? 'block' : 'none';
 
-        // Pass metadata to let the peer know if it is audio only
-        const call = peer.call(currentPeerId, localStream, { metadata: { video } });
+        const call = peer.call(targetPeerId, localStream, { metadata: { video } });
         setupCallHandlers(call);
         openCallOverlay();
-
         document.getElementById('call-status').textContent = video ? 'Video Call' : 'Audio Call';
     } catch (err) {
-        console.error(err);
-        showToast('Media access denied', 'error');
+        console.error('Media access error:', err);
+        showToast('Camera/Microphone access denied', 'error');
+        endCall();
     }
 }
 
 function handleIncomingCall(call) {
-    const type = call.options?.metadata?.video === false ? 'Audio' : 'Video';
-    if (confirm(`Incoming ${type} call from ${call.peer}. Answer?`)) {
-        navigator.mediaDevices.getUserMedia({ video: type === 'Video', audio: true }).then(stream => {
+    // We only accept the stream if we've already transitioned to 'active' via Accept button
+    if (activeCallState.status === 'active' && activeCallState.peerId === call.peer) {
+        const isVideo = call.options?.metadata?.video;
+        navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true }).then(stream => {
             localStream = stream;
             document.getElementById('local-video').srcObject = localStream;
-            document.getElementById('local-video').style.display = type === 'Video' ? 'block' : 'none';
+            document.getElementById('local-video').style.display = isVideo ? 'block' : 'none';
             call.answer(stream);
             setupCallHandlers(call);
             openCallOverlay();
-            document.getElementById('call-status').textContent = `${type} Call in progress`;
+            document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
         }).catch(err => {
-            showToast('Could not access camera/mic', 'error');
-            call.close();
+            console.error('Answer media error:', err);
+            showToast('Could not access media devices', 'error');
+            endCall();
         });
     } else {
+        // Unsolicited stream, reject it
         call.close();
     }
 }
@@ -1002,16 +1112,15 @@ function setupCallHandlers(call) {
             document.getElementById('video-grid').appendChild(remoteVideo);
         }
         remoteVideo.srcObject = remoteStream;
-        remoteVideo.style.display = isAudioOnly ? 'none' : 'block';
+        remoteVideo.style.display = activeCallState.isAudioOnly ? 'none' : 'block';
 
-        if (isAudioOnly) {
-            // Show avatar or text for audio only
+        if (activeCallState.isAudioOnly) {
             let placeholder = document.getElementById('audio-placeholder-' + call.peer);
             if (!placeholder) {
                 placeholder = document.createElement('div');
                 placeholder.id = 'audio-placeholder-' + call.peer;
                 placeholder.className = 'audio-avatar';
-                placeholder.innerHTML = `<div class="avatar pulse">A</div><h4>${call.peer}</h4>`;
+                placeholder.innerHTML = `<div class="avatar pulse" style="width:80px;height:80px;font-size:2rem;">${(activePeers.get(call.peer)?.nickname || call.peer).charAt(0).toUpperCase()}</div><h4 style="margin-top:15px;">${activePeers.get(call.peer)?.nickname || call.peer}</h4>`;
                 document.getElementById('video-grid').appendChild(placeholder);
             }
         }
@@ -1022,18 +1131,88 @@ function setupCallHandlers(call) {
     });
 }
 
+
+
+
+
+
+function playRingtone(type) {
+    // Placeholder for actual Web Audio API integration
+    console.log(`[Audio Debug] Playing ${type} ringtone...`);
+}
+
+function stopRingtone() {
+    // Placeholder for actual Web Audio API integration
+    console.log(`[Audio Debug] Stopping ringtone.`);
+}
+
 function endCall() {
+    stopRingtone();
+
+    if (activeCallState.status === 'active' || activeCallState.status === 'calling' || activeCallState.status === 'ringing') {
+        const p = activePeers.get(activeCallState.peerId);
+        if (p && p.secure && p.sharedKey) {
+            p.conn.send({ type: 'CALL_END' });
+        }
+    }
+
     if (currentCall) currentCall.close();
     if (localStream) localStream.getTracks().forEach(t => t.stop());
+
     document.getElementById('call-overlay').classList.remove('active');
+    document.getElementById('incoming-call-overlay').classList.remove('active');
+    document.getElementById('outgoing-call-overlay').classList.remove('active');
+
+    // Remove remote videos and placeholders
+    const remoteVideos = document.querySelectorAll('video[id^="remote-video-"]');
+    remoteVideos.forEach(v => v.remove());
+    const placeholders = document.querySelectorAll('.audio-avatar');
+    placeholders.forEach(p => p.remove());
+
     document.getElementById('video-grid').innerHTML = '<video id="local-video" autoplay muted playsinline></video>';
+
+    // reset state
+    activeCallState = { peerId: null, status: 'idle', direction: null, isAudioOnly: true, groupId: null };
+    currentCall = null;
+    localStream = null;
+
     showToast('Call ended');
 }
+
 
 // --- UI HELPERS ---
 function setupEventListeners() {
     const peerInput = document.getElementById('peer-id-input');
     const connectBtn = document.getElementById('connect-btn');
+
+    // Dialer Buttons
+    document.getElementById('accept-call-btn').onclick = () => {
+        if (activeCallState.status === 'ringing' && activeCallState.peerId) {
+            const p = activePeers.get(activeCallState.peerId);
+            if (p && p.secure) {
+                activeCallState.status = 'active';
+                document.getElementById('incoming-call-overlay').classList.remove('active');
+                p.conn.send({ type: 'CALL_ACCEPT' });
+                // We don't start media here; the Outbound caller initiates the stream upon receiving ACCEPT.
+            }
+        }
+    };
+
+    document.getElementById('reject-call-btn').onclick = () => {
+        if (activeCallState.status === 'ringing' && activeCallState.peerId) {
+            const p = activePeers.get(activeCallState.peerId);
+            if (p && p.secure) p.conn.send({ type: 'CALL_REJECT' });
+            endCall();
+        }
+    };
+
+    document.getElementById('cancel-call-btn').onclick = () => {
+        if ((activeCallState.status === 'calling' || activeCallState.status === 'ringing') && activeCallState.peerId) {
+            const p = activePeers.get(activeCallState.peerId);
+            if (p && p.secure) p.conn.send({ type: 'CALL_END' });
+            endCall();
+        }
+    };
 
     connectBtn.onclick = () => {
         const id = peerInput.value.trim();
