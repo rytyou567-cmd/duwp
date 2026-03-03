@@ -530,7 +530,8 @@ video {
 }
 
 .call-overlay.active {
-    display: flex;
+    display: flex !important;
+    flex-direction: column;
     animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
