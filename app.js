@@ -230,6 +230,7 @@ async function handleIncomingData(peerId, data) {
         case 'CALL_REJECT':
         case 'CALL_BUSY':
         case 'CALL_END':
+        case 'CALL_VIDEO_STATE':
             handleCallSignaling(peerId, data);
             break;
         case 'GROUP_INVITE':
@@ -1067,6 +1068,22 @@ function handleCallSignaling(peerId, data) {
                 endCall(false);
             }
             break;
+
+        case 'CALL_VIDEO_STATE':
+            if (activeCallState.peerId === peerId) {
+                activeCallState.isAudioOnly = !data.hasVideo;
+                if (callWindow && !callWindow.closed) {
+                    const remoteVideo = callWindow.document.getElementById('remote-video-' + peerId);
+                    if (remoteVideo) {
+                        remoteVideo.style.display = data.hasVideo ? 'block' : 'none';
+                    }
+                    const placeholder = callWindow.document.getElementById('audio-placeholder-' + peerId);
+                    if (placeholder) {
+                        placeholder.style.display = data.hasVideo ? 'none' : 'flex';
+                    }
+                }
+            }
+            break;
     }
 }
 
@@ -1233,31 +1250,38 @@ window.onIncomingCallWindowLoaded = async (popup) => {
 function setupCallHandlers(call) {
     currentCall = call;
     call.on('stream', (remoteStream) => {
-        let remoteVideo = document.getElementById('remote-video-' + call.peer);
+        const targetDoc = (callWindow && !callWindow.closed) ? callWindow.document : document;
+        const videoGrid = targetDoc.getElementById('video-grid');
+        if (!videoGrid) return; // Prevent crashes if UI isn't ready
+
+        let remoteVideo = targetDoc.getElementById('remote-video-' + call.peer);
         if (!remoteVideo) {
-            remoteVideo = document.createElement('video');
+            remoteVideo = targetDoc.createElement('video');
             remoteVideo.id = 'remote-video-' + call.peer;
             remoteVideo.autoplay = true;
             remoteVideo.playsInline = true;
-            document.getElementById('video-grid').appendChild(remoteVideo);
+            videoGrid.appendChild(remoteVideo);
         }
         remoteVideo.srcObject = remoteStream;
         remoteVideo.style.display = activeCallState.isAudioOnly ? 'none' : 'block';
 
+        let placeholder = targetDoc.getElementById('audio-placeholder-' + call.peer);
         if (activeCallState.isAudioOnly) {
-            let placeholder = document.getElementById('audio-placeholder-' + call.peer);
             if (!placeholder) {
-                placeholder = document.createElement('div');
+                placeholder = targetDoc.createElement('div');
                 placeholder.id = 'audio-placeholder-' + call.peer;
                 placeholder.className = 'audio-avatar';
                 placeholder.innerHTML = `<div class="avatar pulse" style="width:80px;height:80px;font-size:2rem;">${(activePeers.get(call.peer)?.nickname || call.peer).charAt(0).toUpperCase()}</div><h4 style="margin-top:15px;">${activePeers.get(call.peer)?.nickname || call.peer}</h4>`;
-                document.getElementById('video-grid').appendChild(placeholder);
+                videoGrid.appendChild(placeholder);
             }
+            placeholder.style.display = 'flex';
+        } else if (placeholder) {
+            placeholder.style.display = 'none';
         }
     });
 
     call.on('close', () => {
-        endCall();
+        endCall(false);
     });
 }
 
@@ -1353,7 +1377,90 @@ function attachCallWindowListeners(popup) {
         endCall();
     };
 
-    // We skip screen share logic for now or implement if needed
+    popup.document.getElementById('share-screen-btn').onclick = async () => {
+        const btn = popup.document.getElementById('share-screen-btn');
+
+        if (btn.classList.contains('active-screen')) {
+            // Stop screen sharing and revert to camera
+            try {
+                let newStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                replaceCallStream(newStream, popup);
+                btn.classList.remove('active-screen');
+
+                // Preserve mute state
+                const muteBtn = popup.document.getElementById('mute-btn');
+                const isMuted = muteBtn.classList.contains('active-toggle');
+                newStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+
+                showToast('Screen sharing stopped');
+            } catch (err) {
+                console.error('Revert to camera failed', err);
+                showToast('Failed to access camera', 'error');
+            }
+            return;
+        }
+
+        // Start screen sharing
+        try {
+            const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+
+            // Keep microphone audio if present
+            const audioTracks = localStream ? localStream.getAudioTracks() : [];
+            if (audioTracks.length > 0) {
+                screenStream.addTrack(audioTracks[0]);
+            }
+
+            replaceCallStream(screenStream, popup);
+            btn.classList.add('active-screen');
+            showToast('Screen sharing started');
+
+            // Handle browser-level "Stop sharing" button
+            screenStream.getVideoTracks()[0].onended = async () => {
+                if (btn.classList.contains('active-screen')) {
+                    btn.click();
+                }
+            };
+        } catch (err) {
+            console.error('Screen sharing failed', err);
+            showToast('Could not share screen', 'error');
+        }
+    };
+}
+
+function replaceCallStream(newStream, popup) {
+    if (!currentCall || !currentCall.peerConnection) return;
+
+    // Stop old video tracks
+    const oldVideoTracks = localStream ? localStream.getVideoTracks() : [];
+    oldVideoTracks.forEach(t => t.stop());
+
+    // Update local video element
+    const localVid = popup ? popup.document.getElementById('local-video') : document.getElementById('local-video');
+    if (localVid) {
+        localVid.srcObject = newStream;
+        localVid.style.display = newStream.getVideoTracks().length > 0 ? 'block' : 'none';
+        localVid.muted = true;
+    }
+
+    // Replace tracks in the WebRTC peer connection
+    const senders = currentCall.peerConnection.getSenders();
+
+    // Replace video track
+    const videoTrack = newStream.getVideoTracks()[0];
+    const videoSender = senders.find(s => s.track && s.track.kind === 'video');
+    if (videoSender && videoTrack) {
+        videoSender.replaceTrack(videoTrack).catch(e => console.error("Replace video track error", e));
+    } else if (!videoSender && videoTrack) {
+        currentCall.peerConnection.addTrack(videoTrack, newStream);
+    }
+
+    localStream = newStream;
+
+    // Signal the remote side about the video state change
+    const p = activePeers.get(activeCallState.peerId);
+    if (p && p.secure && p.sharedKey) {
+        p.conn.send({ type: 'CALL_VIDEO_STATE', hasVideo: newStream.getVideoTracks().length > 0 });
+    }
 }
 
 
