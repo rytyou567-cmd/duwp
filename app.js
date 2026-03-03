@@ -1054,13 +1054,13 @@ function handleCallSignaling(peerId, data) {
         case 'CALL_BUSY':
             if (activeCallState.peerId === peerId) {
                 showToast(data.type === 'CALL_BUSY' ? 'User is busy' : 'Call declined', 'error');
-                endCall();
+                endCall(false);
             }
             break;
 
         case 'CALL_END':
             if (activeCallState.peerId === peerId) {
-                endCall();
+                endCall(false);
             }
             break;
     }
@@ -1069,6 +1069,10 @@ function handleCallSignaling(peerId, data) {
 async function initiateMediaStream(targetPeerId, video) {
     try {
         localStream = await navigator.mediaDevices.getUserMedia({ video: video, audio: true });
+        if (activeCallState.status === 'idle') {
+            localStream.getTracks().forEach(t => t.stop());
+            return;
+        }
     } catch (err) {
         console.warn('Media access denied, falling back to silent stream:', err);
         showToast('No microphone permission. You are muted.', 'warning');
@@ -1104,6 +1108,10 @@ async function handleIncomingCall(call) {
         const isVideo = call.options?.metadata?.video;
         try {
             localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+            if (activeCallState.status === 'idle') {
+                localStream.getTracks().forEach(t => t.stop());
+                return;
+            }
         } catch (err) {
             console.warn('Answer media error, falling back to silent stream:', err);
             showToast('No microphone permission. You are muted.', 'warning');
@@ -1182,10 +1190,10 @@ function stopRingtone() {
     console.log(`[Audio Debug] Stopping ringtone.`);
 }
 
-function endCall() {
+function endCall(sendSignal = true) {
     stopRingtone();
 
-    if (activeCallState.status === 'active' || activeCallState.status === 'calling' || activeCallState.status === 'ringing') {
+    if (sendSignal && (activeCallState.status === 'active' || activeCallState.status === 'calling' || activeCallState.status === 'ringing')) {
         const p = activePeers.get(activeCallState.peerId);
         if (p && p.secure && p.sharedKey) {
             p.conn.send({ type: 'CALL_END' });
@@ -1200,6 +1208,14 @@ function endCall() {
         const localVid = document.getElementById('local-video');
         if (localVid) localVid.srcObject = null;
     }
+
+    // Reset control buttons
+    const shareBtn = document.getElementById('share-screen-btn');
+    if (shareBtn) shareBtn.classList.remove('active-screen');
+    const muteBtn = document.getElementById('mute-btn');
+    if (muteBtn) muteBtn.classList.remove('active-toggle');
+    const outBtn = document.getElementById('audio-out-btn');
+    if (outBtn) outBtn.classList.remove('active-toggle');
 
     document.getElementById('call-overlay').classList.remove('active');
     document.getElementById('incoming-call-overlay').classList.remove('active');
@@ -1251,7 +1267,7 @@ function setupEventListeners() {
         if (activeCallState.status === 'ringing' && activeCallState.peerId) {
             const p = activePeers.get(activeCallState.peerId);
             if (p && p.secure) p.conn.send({ type: 'CALL_REJECT' });
-            endCall();
+            endCall(false);
         }
     };
 
@@ -1259,7 +1275,7 @@ function setupEventListeners() {
         if ((activeCallState.status === 'calling' || activeCallState.status === 'ringing') && activeCallState.peerId) {
             const p = activePeers.get(activeCallState.peerId);
             if (p && p.secure) p.conn.send({ type: 'CALL_END' });
-            endCall();
+            endCall(false);
         }
     };
 
@@ -1377,31 +1393,7 @@ function setupEventListeners() {
     document.getElementById('voice-call-btn').onclick = () => startCall(false);
     document.getElementById('video-call-btn').onclick = () => startCall(true);
     document.getElementById('end-call-btn').onclick = endCall;
-    document.getElementById('accept-call-btn').onclick = () => {
-        if (activeCallState.peerId) {
-            const p = activePeers.get(activeCallState.peerId);
-            if (p?.secure) {
-                p.conn.send({ type: 'CALL_ACCEPT' });
-                activeCallState.status = 'active';
-                document.getElementById('incoming-call-overlay').classList.remove('active');
-                initiateMediaStream(activeCallState.peerId, !activeCallState.isAudioOnly);
-            }
-        }
-    };
-    document.getElementById('reject-call-btn').onclick = () => {
-        if (activeCallState.peerId) {
-            const p = activePeers.get(activeCallState.peerId);
-            if (p?.secure) p.conn.send({ type: 'CALL_REJECT' });
-        }
-        endCall();
-    };
-    document.getElementById('cancel-call-btn').onclick = () => {
-        if (activeCallState.peerId) {
-            const p = activePeers.get(activeCallState.peerId);
-            if (p?.secure) p.conn.send({ type: 'CALL_END' });
-        }
-        endCall();
-    };
+    // The duplicate buttons were removed from here to prevent event overwriting and stream splitting.
     // Call Control Toggles
     document.getElementById('mute-btn').onclick = () => {
         const btn = document.getElementById('mute-btn');
