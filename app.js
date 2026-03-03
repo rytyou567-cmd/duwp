@@ -156,7 +156,7 @@ async function setupConnection(conn) {
             joinedNexus: sharedGroups
         });
     });
-
+ 
     conn.on('data', async (data) => {
         await handleIncomingData(peerId, data);
     });
@@ -185,9 +185,6 @@ async function setupConnection(conn) {
     });
 }
 
-function openCallOverlay() {
-    document.getElementById('call-overlay').classList.add('active');
-}
 
 async function handleIncomingData(peerId, data) {
     const p = activePeers.get(peerId);
@@ -1869,3 +1866,4 @@ async function handleIncomingBeamSync(peerId, data) {
         isRemoteChange = false;
     } catch (e) { console.error(e); }
 }
+
