@@ -1011,6 +1011,12 @@ async function startCall(video = true) {
     document.getElementById('outgoing-call-status').textContent = `Calling...`;
     document.getElementById('outgoing-call-overlay').classList.add('active');
 
+    // Synchronous Tab Opening
+    if (!callWindow || callWindow.closed) {
+        isCallWindowReady = false;
+        callWindow = window.open('call.html', '_blank');
+    }
+
     // Send Offer Signal
     p.conn.send({ type: 'CALL_OFFER', video });
 }
@@ -1087,33 +1093,42 @@ function handleCallSignaling(peerId, data) {
     }
 }
 
-let pendingCallVideo = null;
-let pendingTargetPeer = null;
+let callWindowReadyResolver = null;
+let isCallWindowReady = false;
 
-async function initiateMediaStream(targetPeerId, video) {
-    pendingTargetPeer = targetPeerId;
-    pendingCallVideo = video;
-
-    // Check if the popup is already open
-    if (callWindow && !callWindow.closed) {
-        window.onCallWindowLoaded(callWindow);
-    } else {
-        // Pop out the UI into a new window
-        callWindow = window.open('call.html', 'NeuralLinkCall', 'width=1000,height=700,menubar=no,toolbar=no,location=no,status=no');
+window.onCallWindowLoaded = (popup) => {
+    callWindow = popup;
+    isCallWindowReady = true;
+    if (callWindowReadyResolver) {
+        callWindowReadyResolver(popup);
+        callWindowReadyResolver = null;
     }
+};
+
+window.onCallWindowClosed = () => {
+    callWindow = null;
+    isCallWindowReady = false;
+    endCall(false);
+};
+
+async function waitForCallWindow() {
+    if (callWindow && !callWindow.closed && isCallWindowReady) {
+        return callWindow;
+    }
+    return new Promise(resolve => {
+        callWindowReadyResolver = resolve;
+    });
 }
 
-// Global callback fired by call.html when it finishes parsing its DOM
-window.onCallWindowLoaded = async (popup) => {
-    callWindow = popup;
-    const isVideo = pendingCallVideo;
-    const targetPeerId = pendingTargetPeer;
+async function initiateMediaStream(targetPeerId, video) {
+    const popup = await waitForCallWindow();
+    const isVideo = video;
 
     try {
         localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
         if (activeCallState.status === 'idle') {
             localStream.getTracks().forEach(t => t.stop());
-            callWindow.close();
+            popup.close();
             return;
         }
     } catch (err) {
@@ -1130,11 +1145,11 @@ window.onCallWindowLoaded = async (popup) => {
         localStream = dst.stream;
         localStream.getAudioTracks()[0].enabled = false;
 
-        const muteBtn = callWindow.document.getElementById('mute-btn');
+        const muteBtn = popup.document.getElementById('mute-btn');
         if (muteBtn) muteBtn.classList.add('active-toggle');
     }
 
-    const localVid = callWindow.document.getElementById('local-video');
+    const localVid = popup.document.getElementById('local-video');
     if (localVid) {
         localVid.srcObject = localStream;
         localVid.style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
@@ -1156,11 +1171,11 @@ window.onCallWindowLoaded = async (popup) => {
     setupCallHandlers(call);
 
     // Attach event listeners to the new window's buttons
-    attachCallWindowListeners(callWindow);
+    attachCallWindowListeners(popup);
 
-    callWindow.document.getElementById('call-status').textContent = isVideo ? 'Video Call' : 'Audio Call';
+    popup.document.getElementById('call-status').textContent = isVideo ? 'Video Call' : 'Audio Call';
     document.getElementById('outgoing-call-overlay').classList.remove('active');
-};
+}
 
 let pendingIncomingCall = null;
 
@@ -1192,60 +1207,49 @@ async function handleIncomingCall(call) {
 
     // We only accept the stream if we've already transitioned to 'active' via Accept button
     if (activeCallState.status === 'active' && activeCallState.peerId === call.peer) {
-        pendingIncomingCall = call;
+        const popup = await waitForCallWindow();
+        const isVideo = call.options?.metadata?.video;
 
-        if (callWindow && !callWindow.closed) {
-            window.onIncomingCallWindowLoaded(callWindow);
-        } else {
-            callWindow = window.open('call.html', 'NeuralLinkCall', 'width=1000,height=700,menubar=no,toolbar=no,location=no,status=no');
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+            if (activeCallState.status === 'idle') {
+                localStream.getTracks().forEach(t => t.stop());
+                popup.close();
+                return;
+            }
+        } catch (err) {
+            console.warn('Answer media error, falling back to silent stream:', err);
+            showToast('No microphone permission. You are muted.', 'warning');
+
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const dst = ctx.createMediaStreamDestination();
+            const oscillator = ctx.createOscillator();
+            oscillator.connect(dst);
+            oscillator.start();
+            localStream = dst.stream;
+            localStream.getAudioTracks()[0].enabled = false;
+
+            const muteBtn = popup.document.getElementById('mute-btn');
+            if (muteBtn) muteBtn.classList.add('active-toggle');
         }
+
+        const localVid = popup.document.getElementById('local-video');
+        if (localVid) {
+            localVid.srcObject = localStream;
+            localVid.style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
+            localVid.muted = true;
+        }
+
+        call.answer(localStream);
+        setupCallHandlers(call);
+        attachCallWindowListeners(popup);
+
+        popup.document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
     } else {
         // Unsolicited stream, reject it
         call.close();
     }
 }
-
-window.onIncomingCallWindowLoaded = async (popup) => {
-    callWindow = popup;
-    const call = pendingIncomingCall;
-    const isVideo = call.options?.metadata?.video;
-
-    try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
-        if (activeCallState.status === 'idle') {
-            localStream.getTracks().forEach(t => t.stop());
-            callWindow.close();
-            return;
-        }
-    } catch (err) {
-        console.warn('Answer media error, falling back to silent stream:', err);
-        showToast('No microphone permission. You are muted.', 'warning');
-
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const dst = ctx.createMediaStreamDestination();
-        const oscillator = ctx.createOscillator();
-        oscillator.connect(dst);
-        oscillator.start();
-        localStream = dst.stream;
-        localStream.getAudioTracks()[0].enabled = false;
-
-        const muteBtn = callWindow.document.getElementById('mute-btn');
-        if (muteBtn) muteBtn.classList.add('active-toggle');
-    }
-
-    const localVid = callWindow.document.getElementById('local-video');
-    if (localVid) {
-        localVid.srcObject = localStream;
-        localVid.style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
-        localVid.muted = true;
-    }
-
-    call.answer(localStream);
-    setupCallHandlers(call);
-    attachCallWindowListeners(callWindow);
-
-    callWindow.document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
-};
 
 function setupCallHandlers(call) {
     currentCall = call;
@@ -1474,6 +1478,12 @@ function setupEventListeners() {
         if (activeCallState.status === 'ringing' && activeCallState.peerId) {
             const p = activePeers.get(activeCallState.peerId);
             if (p && p.secure) {
+                // Synchronous Tab Opening
+                if (!callWindow || callWindow.closed) {
+                    isCallWindowReady = false;
+                    callWindow = window.open('call.html', '_blank');
+                }
+
                 activeCallState.status = 'active';
                 document.getElementById('incoming-call-overlay').classList.remove('active');
                 p.conn.send({ type: 'CALL_ACCEPT' });
@@ -1610,119 +1620,7 @@ function setupEventListeners() {
     // Call Actions
     document.getElementById('voice-call-btn').onclick = () => startCall(false);
     document.getElementById('video-call-btn').onclick = () => startCall(true);
-    document.getElementById('end-call-btn').onclick = endCall;
     // The duplicate buttons were removed from here to prevent event overwriting and stream splitting.
-    // Call Control Toggles
-    document.getElementById('mute-btn').onclick = () => {
-        const btn = document.getElementById('mute-btn');
-        if (localStream) {
-            const audioTrack = localStream.getAudioTracks()[0];
-            if (audioTrack) {
-                audioTrack.enabled = !audioTrack.enabled;
-                btn.classList.toggle('active-toggle', !audioTrack.enabled);
-            }
-        }
-    };
-
-    document.getElementById('audio-out-btn').onclick = async () => {
-        const btn = document.getElementById('audio-out-btn');
-        const videos = document.querySelectorAll('#video-grid video');
-
-        // This attempts to toggle between default speaker and earpiece 
-        // Note: setSinkId is experimental and only works on supported browsers/devices
-        try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
-
-            // Very basic heuristic for mobile: toggle between the first two available outputs
-            if (audioOutputs.length > 1) {
-                const isEarpiece = btn.classList.toggle('active-toggle');
-                const targetDevice = isEarpiece ? audioOutputs[1].deviceId : audioOutputs[0].deviceId;
-
-                for (let video of videos) {
-                    if (typeof video.setSinkId === 'function') {
-                        await video.setSinkId(targetDevice);
-                    }
-                }
-                showToast(isEarpiece ? 'Switched to Earpiece' : 'Switched to Speaker');
-            } else {
-                showToast('Secondary audio output not found.', 'error');
-            }
-        } catch (err) {
-            console.error('Audio routing error', err);
-            showToast('Audio routing not supported on this browser.', 'error');
-        }
-    };
-
-    document.getElementById('share-screen-btn').onclick = async () => {
-        const btn = document.getElementById('share-screen-btn');
-
-        if (btn.classList.contains('active-screen')) {
-            // Stop screen sharing and revert to camera
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                replaceCallStream(stream);
-                btn.classList.remove('active-screen');
-                showToast('Screen sharing stopped');
-            } catch (err) {
-                console.error('Revert to camera failed', err);
-                showToast('Failed to access camera', 'error');
-            }
-            return;
-        }
-
-        // Start screen sharing
-        try {
-            const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-
-            // Keep microphone audio if present
-            if (localStream && localStream.getAudioTracks().length > 0) {
-                const audioTrack = localStream.getAudioTracks()[0];
-                screenStream.addTrack(audioTrack);
-            }
-
-            replaceCallStream(screenStream);
-
-            // Listen for native "Stop sharing" button in browser UI
-            screenStream.getVideoTracks()[0].onended = async () => {
-                try {
-                    const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                    replaceCallStream(cameraStream);
-                } catch (e) { }
-                btn.classList.remove('active-screen');
-                showToast('Screen sharing ended');
-            };
-
-            btn.classList.add('active-screen');
-            showToast('Screen sharing active');
-        } catch (err) {
-            console.error('Screen share error', err);
-            showToast('Screen sharing cancelled', 'error');
-        }
-    };
-
-    // Helper: Swap tracks in active call without ending it
-    function replaceCallStream(newStream) {
-        if (localStream) {
-            // Stop old video tracks
-            localStream.getVideoTracks().forEach(t => t.stop());
-        }
-        localStream = newStream;
-
-        // Update local video element
-        const localVid = document.getElementById('local-video');
-        localVid.srcObject = newStream;
-
-        // Replace track in PeerJS connection if active
-        if (currentCall && currentCall.peerConnection) {
-            const senders = currentCall.peerConnection.getSenders();
-            const videoSender = senders.find(s => s.track && s.track.kind === 'video');
-            if (videoSender && newStream.getVideoTracks().length > 0) {
-                videoSender.replaceTrack(newStream.getVideoTracks()[0]);
-            }
-        }
-    }
-
     // Manual Hub Entry
     document.getElementById('add-manual-btn').onclick = () => {
         const input = document.getElementById('manual-hub-input');
