@@ -1748,9 +1748,7 @@ function renderMessages() {
     container.scrollTop = container.scrollHeight;
 }
 
-function openCallOverlay() {
-    document.getElementById('call-overlay').classList.add('active');
-}
+
 
 function showToast(msg, type = 'info') {
     const container = document.getElementById('toast-container');
@@ -1907,3 +1905,4 @@ async function handleIncomingBeamSync(peerId, data) {
         isRemoteChange = false;
     } catch (e) { console.error(e); }
 }
+
