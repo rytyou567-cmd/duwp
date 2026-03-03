@@ -1069,37 +1069,65 @@ function handleCallSignaling(peerId, data) {
 async function initiateMediaStream(targetPeerId, video) {
     try {
         localStream = await navigator.mediaDevices.getUserMedia({ video: video, audio: true });
-        document.getElementById('local-video').srcObject = localStream;
-        document.getElementById('local-video').style.display = video ? 'block' : 'none';
-
-        const call = peer.call(targetPeerId, localStream, { metadata: { video } });
-        setupCallHandlers(call);
-        openCallOverlay();
-        document.getElementById('call-status').textContent = video ? 'Video Call' : 'Audio Call';
     } catch (err) {
-        console.error('Media access error:', err);
-        showToast('Camera/Microphone access denied', 'error');
-        endCall();
+        console.warn('Media access denied, falling back to silent stream:', err);
+        showToast('No microphone permission. You are muted.', 'warning');
+
+        // Spawn a silent audio stream to keep WebRTC connections alive
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const dst = ctx.createMediaStreamDestination();
+        const oscillator = ctx.createOscillator();
+        oscillator.connect(dst);
+        oscillator.start();
+
+        localStream = dst.stream;
+        localStream.getAudioTracks()[0].enabled = false;
+
+        const muteBtn = document.getElementById('mute-btn');
+        if (muteBtn) muteBtn.classList.add('active-toggle');
     }
+
+    const localVid = document.getElementById('local-video');
+    localVid.srcObject = localStream;
+    localVid.style.display = video && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
+
+    const call = peer.call(targetPeerId, localStream, { metadata: { video } });
+    setupCallHandlers(call);
+
+    document.getElementById('call-overlay').classList.add('active'); // Directly show PIP
+    document.getElementById('call-status').textContent = video ? 'Video Call' : 'Audio Call';
 }
 
-function handleIncomingCall(call) {
+async function handleIncomingCall(call) {
     // We only accept the stream if we've already transitioned to 'active' via Accept button
     if (activeCallState.status === 'active' && activeCallState.peerId === call.peer) {
         const isVideo = call.options?.metadata?.video;
-        navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true }).then(stream => {
-            localStream = stream;
-            document.getElementById('local-video').srcObject = localStream;
-            document.getElementById('local-video').style.display = isVideo ? 'block' : 'none';
-            call.answer(stream);
-            setupCallHandlers(call);
-            openCallOverlay();
-            document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
-        }).catch(err => {
-            console.error('Answer media error:', err);
-            showToast('Could not access media devices', 'error');
-            endCall();
-        });
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+        } catch (err) {
+            console.warn('Answer media error, falling back to silent stream:', err);
+            showToast('No microphone permission. You are muted.', 'warning');
+
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const dst = ctx.createMediaStreamDestination();
+            const oscillator = ctx.createOscillator();
+            oscillator.connect(dst);
+            oscillator.start();
+            localStream = dst.stream;
+            localStream.getAudioTracks()[0].enabled = false;
+
+            const muteBtn = document.getElementById('mute-btn');
+            if (muteBtn) muteBtn.classList.add('active-toggle');
+        }
+
+        document.getElementById('local-video').srcObject = localStream;
+        document.getElementById('local-video').style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
+
+        call.answer(localStream);
+        setupCallHandlers(call);
+
+        document.getElementById('call-overlay').classList.add('active'); // PIP
+        document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
     } else {
         // Unsolicited stream, reject it
         call.close();
@@ -1169,6 +1197,8 @@ function endCall() {
     }
     if (typeof localStream !== 'undefined' && localStream) {
         localStream.getTracks().forEach(t => t.stop());
+        const localVid = document.getElementById('local-video');
+        if (localVid) localVid.srcObject = null;
     }
 
     document.getElementById('call-overlay').classList.remove('active');
