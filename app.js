@@ -41,10 +41,7 @@ async function init() {
     }
 
     // 2. Core UI & PeerID generation first
-    initPeer();
-    setupEventListeners();
-
-    // 3. Security Setup (Hard Enforced)
+    // 2. Security Setup (Hard Enforced)
     try {
         myKeyPair = await CryptoUtils.generateECCKeyPair();
         if (myKeyPair) {
@@ -55,6 +52,10 @@ async function init() {
         showToast('FATAL ERROR: Encryption engine failed. Neural Link suspended.', 'error');
         // We'll proceed with Peer initialization so the UI stays up, but communications will fail
     }
+
+    // 3. Core UI & PeerID generation last
+    initPeer();
+    setupEventListeners();
 }
 
 function initPeer() {
@@ -206,6 +207,7 @@ async function handleIncomingData(peerId, data) {
             break;
         case 'HANDSHAKE_READY':
             p.secure = true;
+            if (data.publicKey) p.publicKey = data.publicKey;
             if (data.nickname) p.nickname = data.nickname;
             syncHandshakeGroups(data); // Process groups from the responder
             showToast(`Secure link with ${p.nickname || peerId} established`);
@@ -893,6 +895,7 @@ async function handleHandshake(peerId, data) {
     try {
         const peerPubKey = await CryptoUtils.importPublicKey(data.publicKey);
         p.sharedKey = await CryptoUtils.deriveEncryptionKey(myKeyPair.privateKey, peerPubKey);
+        p.publicKey = data.publicKey;
 
         // Process any group memberships sent in handshake
         syncHandshakeGroups(data);
@@ -1121,7 +1124,18 @@ window.onCallWindowLoaded = async (popup) => {
         localVid.muted = true; // Never hear yourself
     }
 
-    const call = peer.call(targetPeerId, localStream, { metadata: { video: isVideo } });
+    const callTimestamp = Date.now();
+    let callToken = "unencrypted";
+    if (myPublicKeyData) {
+        callToken = await CryptoUtils.createKeyBinding(peer.id, myPublicKeyData, callTimestamp);
+    }
+    const call = peer.call(targetPeerId, localStream, {
+        metadata: {
+            video: isVideo,
+            secureToken: callToken,
+            timestamp: callTimestamp
+        }
+    });
     setupCallHandlers(call);
 
     // Attach event listeners to the new window's buttons
@@ -1134,6 +1148,31 @@ window.onCallWindowLoaded = async (popup) => {
 let pendingIncomingCall = null;
 
 async function handleIncomingCall(call) {
+    if (!call.options || !call.options.metadata || !call.options.metadata.secureToken) {
+        console.warn('Rejected incoming stream: Missing encryption binding.');
+        call.close();
+        return;
+    }
+
+    const secureToken = call.options.metadata.secureToken;
+    const callTimestamp = call.options.metadata.timestamp;
+    const callerPeer = activePeers.get(call.peer);
+
+    if (!callerPeer || !callerPeer.secure || !callerPeer.publicKey) {
+        console.warn('Rejected incoming stream: Caller is not a secure peer.');
+        call.close();
+        return;
+    }
+
+    // Verify cryptographic binding
+    const isValidCall = await CryptoUtils.verifyKeyBinding(call.peer, callerPeer.publicKey, callTimestamp, secureToken);
+    if (!isValidCall || secureToken === "unencrypted") {
+        console.warn('Rejected incoming stream: Invalid peer signature.');
+        showToast('Blocked unauthorized media stream.', 'error');
+        call.close();
+        return;
+    }
+
     // We only accept the stream if we've already transitioned to 'active' via Accept button
     if (activeCallState.status === 'active' && activeCallState.peerId === call.peer) {
         pendingIncomingCall = call;
@@ -1381,7 +1420,6 @@ function setupEventListeners() {
 
     document.getElementById('video-call-btn').onclick = () => startCall(true);
     document.getElementById('voice-call-btn').onclick = () => startCall(false);
-    document.getElementById('end-call-btn').onclick = endCall;
 
     document.getElementById('copy-my-id').onclick = () => {
         navigator.clipboard.writeText(peer.id);
