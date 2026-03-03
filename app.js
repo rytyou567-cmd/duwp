@@ -20,9 +20,13 @@ window.Nexus = {
 };
 let localHub = [];
 let remoteHub = [];
-let editor = null;
-let beamModels = new Map(); // targetId -> monaco.editor.ITextModel
+
+let editor;
 let isRemoteChange = false;
+const beamModels = new Map(); // targetId -> monaco model
+
+// Call State
+let currentCall = null;
 
 // --- INITIALIZATION ---
 async function init() {
@@ -1155,8 +1159,12 @@ function endCall() {
         }
     }
 
-    if (currentCall) currentCall.close();
-    if (localStream) localStream.getTracks().forEach(t => t.stop());
+    if (typeof currentCall !== 'undefined' && currentCall) {
+        try { currentCall.close(); } catch (e) { }
+    }
+    if (typeof localStream !== 'undefined' && localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+    }
 
     document.getElementById('call-overlay').classList.remove('active');
     document.getElementById('incoming-call-overlay').classList.remove('active');
@@ -1172,8 +1180,8 @@ function endCall() {
 
     // reset state
     activeCallState = { peerId: null, status: 'idle', direction: null, isAudioOnly: true, groupId: null };
-    currentCall = null;
-    localStream = null;
+    try { currentCall = null; } catch (e) { }
+    try { localStream = null; } catch (e) { }
 
     showToast('Call ended');
 }
@@ -1748,8 +1756,6 @@ function renderMessages() {
     container.scrollTop = container.scrollHeight;
 }
 
-
-
 function showToast(msg, type = 'info') {
     const container = document.getElementById('toast-container');
     const toast = document.createElement('div');
@@ -1905,4 +1911,3 @@ async function handleIncomingBeamSync(peerId, data) {
         isRemoteChange = false;
     } catch (e) { console.error(e); }
 }
-
