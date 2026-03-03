@@ -1360,16 +1360,116 @@ function setupEventListeners() {
         }
         endCall();
     };
+    // Call Control Toggles
     document.getElementById('mute-btn').onclick = () => {
+        const btn = document.getElementById('mute-btn');
         if (localStream) {
             const audioTrack = localStream.getAudioTracks()[0];
             if (audioTrack) {
                 audioTrack.enabled = !audioTrack.enabled;
-                document.getElementById('mute-btn').textContent = audioTrack.enabled ? '🎤' : '🔇';
-                document.getElementById('mute-btn').style.background = audioTrack.enabled ? 'rgba(255, 255, 255, 0.05)' : 'rgba(255, 59, 59, 0.4)';
+                btn.classList.toggle('active-toggle', !audioTrack.enabled);
             }
         }
     };
+
+    document.getElementById('audio-out-btn').onclick = async () => {
+        const btn = document.getElementById('audio-out-btn');
+        const videos = document.querySelectorAll('#video-grid video');
+
+        // This attempts to toggle between default speaker and earpiece 
+        // Note: setSinkId is experimental and only works on supported browsers/devices
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
+
+            // Very basic heuristic for mobile: toggle between the first two available outputs
+            if (audioOutputs.length > 1) {
+                const isEarpiece = btn.classList.toggle('active-toggle');
+                const targetDevice = isEarpiece ? audioOutputs[1].deviceId : audioOutputs[0].deviceId;
+
+                for (let video of videos) {
+                    if (typeof video.setSinkId === 'function') {
+                        await video.setSinkId(targetDevice);
+                    }
+                }
+                showToast(isEarpiece ? 'Switched to Earpiece' : 'Switched to Speaker');
+            } else {
+                showToast('Secondary audio output not found.', 'error');
+            }
+        } catch (err) {
+            console.error('Audio routing error', err);
+            showToast('Audio routing not supported on this browser.', 'error');
+        }
+    };
+
+    document.getElementById('share-screen-btn').onclick = async () => {
+        const btn = document.getElementById('share-screen-btn');
+
+        if (btn.classList.contains('active-screen')) {
+            // Stop screen sharing and revert to camera
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                replaceCallStream(stream);
+                btn.classList.remove('active-screen');
+                showToast('Screen sharing stopped');
+            } catch (err) {
+                console.error('Revert to camera failed', err);
+                showToast('Failed to access camera', 'error');
+            }
+            return;
+        }
+
+        // Start screen sharing
+        try {
+            const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+
+            // Keep microphone audio if present
+            if (localStream && localStream.getAudioTracks().length > 0) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                screenStream.addTrack(audioTrack);
+            }
+
+            replaceCallStream(screenStream);
+
+            // Listen for native "Stop sharing" button in browser UI
+            screenStream.getVideoTracks()[0].onended = async () => {
+                try {
+                    const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    replaceCallStream(cameraStream);
+                } catch (e) { }
+                btn.classList.remove('active-screen');
+                showToast('Screen sharing ended');
+            };
+
+            btn.classList.add('active-screen');
+            showToast('Screen sharing active');
+        } catch (err) {
+            console.error('Screen share error', err);
+            showToast('Screen sharing cancelled', 'error');
+        }
+    };
+
+    // Helper: Swap tracks in active call without ending it
+    function replaceCallStream(newStream) {
+        if (localStream) {
+            // Stop old video tracks
+            localStream.getVideoTracks().forEach(t => t.stop());
+        }
+        localStream = newStream;
+
+        // Update local video element
+        const localVid = document.getElementById('local-video');
+        localVid.srcObject = newStream;
+
+        // Replace track in PeerJS connection if active
+        if (currentCall && currentCall.peerConnection) {
+            const senders = currentCall.peerConnection.getSenders();
+            const videoSender = senders.find(s => s.track && s.track.kind === 'video');
+            if (videoSender && newStream.getVideoTracks().length > 0) {
+                videoSender.replaceTrack(newStream.getVideoTracks()[0]);
+            }
+        }
+    }
 
     // Manual Hub Entry
     document.getElementById('add-manual-btn').onclick = () => {

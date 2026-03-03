@@ -597,6 +597,18 @@ video {
     background: rgba(255, 255, 255, 0.15);
 }
 
+.call-btn.active-toggle {
+    background: rgba(255, 59, 59, 0.2);
+    border-color: #ff3b3b;
+    color: #ff3b3b;
+}
+
+.call-btn.active-screen {
+    background: rgba(0, 242, 255, 0.2);
+    border-color: var(--accent-cyan);
+    color: var(--accent-cyan);
+}
+
 .call-btn.end {
     background: #ff3b3b;
     border-color: #ff3b3b;
