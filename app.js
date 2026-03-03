@@ -156,7 +156,7 @@ async function setupConnection(conn) {
             joinedNexus: sharedGroups
         });
     });
- 
+
     conn.on('data', async (data) => {
         await handleIncomingData(peerId, data);
     });
@@ -1131,7 +1131,9 @@ function setupCallHandlers(call) {
 
 
 
-
+function openCallOverlay() {
+    document.getElementById('call-overlay').classList.add('active');
+}
 
 function playRingtone(type) {
     // Placeholder for actual Web Audio API integration
@@ -1321,6 +1323,45 @@ function setupEventListeners() {
         };
     });
 
+    // Call Actions
+    document.getElementById('voice-call-btn').onclick = () => startCall(false);
+    document.getElementById('video-call-btn').onclick = () => startCall(true);
+    document.getElementById('end-call-btn').onclick = endCall;
+    document.getElementById('accept-call-btn').onclick = () => {
+        if (activeCallState.peerId) {
+            const p = activePeers.get(activeCallState.peerId);
+            if (p?.secure) {
+                p.conn.send({ type: 'CALL_ACCEPT' });
+                activeCallState.status = 'active';
+                document.getElementById('incoming-call-overlay').classList.remove('active');
+                initiateMediaStream(activeCallState.peerId, !activeCallState.isAudioOnly);
+            }
+        }
+    };
+    document.getElementById('reject-call-btn').onclick = () => {
+        if (activeCallState.peerId) {
+            const p = activePeers.get(activeCallState.peerId);
+            if (p?.secure) p.conn.send({ type: 'CALL_REJECT' });
+        }
+        endCall();
+    };
+    document.getElementById('cancel-call-btn').onclick = () => {
+        if (activeCallState.peerId) {
+            const p = activePeers.get(activeCallState.peerId);
+            if (p?.secure) p.conn.send({ type: 'CALL_END' });
+        }
+        endCall();
+    };
+    document.getElementById('mute-btn').onclick = () => {
+        if (localStream) {
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                document.getElementById('mute-btn').textContent = audioTrack.enabled ? '🎤' : '🔇';
+                document.getElementById('mute-btn').style.background = audioTrack.enabled ? 'rgba(255, 255, 255, 0.05)' : 'rgba(255, 59, 59, 0.4)';
+            }
+        }
+    };
 
     // Manual Hub Entry
     document.getElementById('add-manual-btn').onclick = () => {
@@ -1866,4 +1907,3 @@ async function handleIncomingBeamSync(peerId, data) {
         isRemoteChange = false;
     } catch (e) { console.error(e); }
 }
-
