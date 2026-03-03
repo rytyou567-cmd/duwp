@@ -179,9 +179,14 @@ async function setupConnection(conn) {
             input.disabled = true;
             document.getElementById('send-btn').disabled = true;
 
-            // If we are in a call with them, end it automatically
+            // If we are in a call with them, show on UI then end after a delay
             if (activeCallState.peerId === peerId) {
-                endCall();
+                const callStatus = document.getElementById('call-status');
+                if (callStatus) {
+                    callStatus.textContent = 'Connection Lost...';
+                    callStatus.style.color = '#ff4444';
+                }
+                setTimeout(() => endCall(), 1500);
             }
         }
 
@@ -1177,6 +1182,13 @@ function endCall() {
     placeholders.forEach(p => p.remove());
 
     document.getElementById('video-grid').innerHTML = '<video id="local-video" autoplay muted playsinline></video>';
+
+    // reset UI visuals
+    const callStatus = document.getElementById('call-status');
+    if (callStatus) {
+        callStatus.textContent = 'Connecting Neural Link...';
+        callStatus.style.color = '';
+    }
 
     // reset state
     activeCallState = { peerId: null, status: 'idle', direction: null, isAudioOnly: true, groupId: null };

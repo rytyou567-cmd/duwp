@@ -90,7 +90,7 @@ body {
     justify-content: space-between;
     align-items: center;
     cursor: pointer;
-    transition: 0.3s;
+    transition: all 0.3s;
 }
 
 .my-id-container:hover {
