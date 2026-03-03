@@ -27,6 +27,7 @@ const beamModels = new Map(); // targetId -> monaco model
 
 // Call State
 let currentCall = null;
+let callWindow = null;
 
 // --- INITIALIZATION ---
 async function init() {
@@ -1066,11 +1067,33 @@ function handleCallSignaling(peerId, data) {
     }
 }
 
+let pendingCallVideo = null;
+let pendingTargetPeer = null;
+
 async function initiateMediaStream(targetPeerId, video) {
+    pendingTargetPeer = targetPeerId;
+    pendingCallVideo = video;
+
+    // Check if the popup is already open
+    if (callWindow && !callWindow.closed) {
+        window.onCallWindowLoaded(callWindow);
+    } else {
+        // Pop out the UI into a new window
+        callWindow = window.open('call.html', 'NeuralLinkCall', 'width=1000,height=700,menubar=no,toolbar=no,location=no,status=no');
+    }
+}
+
+// Global callback fired by call.html when it finishes parsing its DOM
+window.onCallWindowLoaded = async (popup) => {
+    callWindow = popup;
+    const isVideo = pendingCallVideo;
+    const targetPeerId = pendingTargetPeer;
+
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: video, audio: true });
+        localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
         if (activeCallState.status === 'idle') {
             localStream.getTracks().forEach(t => t.stop());
+            callWindow.close();
             return;
         }
     } catch (err) {
@@ -1087,60 +1110,86 @@ async function initiateMediaStream(targetPeerId, video) {
         localStream = dst.stream;
         localStream.getAudioTracks()[0].enabled = false;
 
-        const muteBtn = document.getElementById('mute-btn');
+        const muteBtn = callWindow.document.getElementById('mute-btn');
         if (muteBtn) muteBtn.classList.add('active-toggle');
     }
 
-    const localVid = document.getElementById('local-video');
-    localVid.srcObject = localStream;
-    localVid.style.display = video && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
+    const localVid = callWindow.document.getElementById('local-video');
+    if (localVid) {
+        localVid.srcObject = localStream;
+        localVid.style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
+        localVid.muted = true; // Never hear yourself
+    }
 
-    const call = peer.call(targetPeerId, localStream, { metadata: { video } });
+    const call = peer.call(targetPeerId, localStream, { metadata: { video: isVideo } });
     setupCallHandlers(call);
 
-    document.getElementById('call-overlay').classList.add('active'); // Directly show PIP
-    document.getElementById('call-status').textContent = video ? 'Video Call' : 'Audio Call';
-}
+    // Attach event listeners to the new window's buttons
+    attachCallWindowListeners(callWindow);
+
+    callWindow.document.getElementById('call-status').textContent = isVideo ? 'Video Call' : 'Audio Call';
+    document.getElementById('outgoing-call-overlay').classList.remove('active');
+};
+
+let pendingIncomingCall = null;
 
 async function handleIncomingCall(call) {
     // We only accept the stream if we've already transitioned to 'active' via Accept button
     if (activeCallState.status === 'active' && activeCallState.peerId === call.peer) {
-        const isVideo = call.options?.metadata?.video;
-        try {
-            localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
-            if (activeCallState.status === 'idle') {
-                localStream.getTracks().forEach(t => t.stop());
-                return;
-            }
-        } catch (err) {
-            console.warn('Answer media error, falling back to silent stream:', err);
-            showToast('No microphone permission. You are muted.', 'warning');
+        pendingIncomingCall = call;
 
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const dst = ctx.createMediaStreamDestination();
-            const oscillator = ctx.createOscillator();
-            oscillator.connect(dst);
-            oscillator.start();
-            localStream = dst.stream;
-            localStream.getAudioTracks()[0].enabled = false;
-
-            const muteBtn = document.getElementById('mute-btn');
-            if (muteBtn) muteBtn.classList.add('active-toggle');
+        if (callWindow && !callWindow.closed) {
+            window.onIncomingCallWindowLoaded(callWindow);
+        } else {
+            callWindow = window.open('call.html', 'NeuralLinkCall', 'width=1000,height=700,menubar=no,toolbar=no,location=no,status=no');
         }
-
-        document.getElementById('local-video').srcObject = localStream;
-        document.getElementById('local-video').style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
-
-        call.answer(localStream);
-        setupCallHandlers(call);
-
-        document.getElementById('call-overlay').classList.add('active'); // PIP
-        document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
     } else {
         // Unsolicited stream, reject it
         call.close();
     }
 }
+
+window.onIncomingCallWindowLoaded = async (popup) => {
+    callWindow = popup;
+    const call = pendingIncomingCall;
+    const isVideo = call.options?.metadata?.video;
+
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+        if (activeCallState.status === 'idle') {
+            localStream.getTracks().forEach(t => t.stop());
+            callWindow.close();
+            return;
+        }
+    } catch (err) {
+        console.warn('Answer media error, falling back to silent stream:', err);
+        showToast('No microphone permission. You are muted.', 'warning');
+
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const dst = ctx.createMediaStreamDestination();
+        const oscillator = ctx.createOscillator();
+        oscillator.connect(dst);
+        oscillator.start();
+        localStream = dst.stream;
+        localStream.getAudioTracks()[0].enabled = false;
+
+        const muteBtn = callWindow.document.getElementById('mute-btn');
+        if (muteBtn) muteBtn.classList.add('active-toggle');
+    }
+
+    const localVid = callWindow.document.getElementById('local-video');
+    if (localVid) {
+        localVid.srcObject = localStream;
+        localVid.style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
+        localVid.muted = true;
+    }
+
+    call.answer(localStream);
+    setupCallHandlers(call);
+    attachCallWindowListeners(callWindow);
+
+    callWindow.document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
+};
 
 function setupCallHandlers(call) {
     currentCall = call;
@@ -1205,43 +1254,67 @@ function endCall(sendSignal = true) {
     }
     if (typeof localStream !== 'undefined' && localStream) {
         localStream.getTracks().forEach(t => t.stop());
-        const localVid = document.getElementById('local-video');
-        if (localVid) localVid.srcObject = null;
     }
 
-    // Reset control buttons
-    const shareBtn = document.getElementById('share-screen-btn');
-    if (shareBtn) shareBtn.classList.remove('active-screen');
-    const muteBtn = document.getElementById('mute-btn');
-    if (muteBtn) muteBtn.classList.remove('active-toggle');
-    const outBtn = document.getElementById('audio-out-btn');
-    if (outBtn) outBtn.classList.remove('active-toggle');
+    if (callWindow && !callWindow.closed) {
+        callWindow.close();
+    }
+    callWindow = null;
 
-    document.getElementById('call-overlay').classList.remove('active');
     document.getElementById('incoming-call-overlay').classList.remove('active');
     document.getElementById('outgoing-call-overlay').classList.remove('active');
-
-    // Remove remote videos and placeholders
-    const remoteVideos = document.querySelectorAll('video[id^="remote-video-"]');
-    remoteVideos.forEach(v => v.remove());
-    const placeholders = document.querySelectorAll('.audio-avatar');
-    placeholders.forEach(p => p.remove());
-
-    document.getElementById('video-grid').innerHTML = '<video id="local-video" autoplay muted playsinline></video>';
-
-    // reset UI visuals
-    const callStatus = document.getElementById('call-status');
-    if (callStatus) {
-        callStatus.textContent = 'Connecting Neural Link...';
-        callStatus.style.color = '';
-    }
 
     // reset state
     activeCallState = { peerId: null, status: 'idle', direction: null, isAudioOnly: true, groupId: null };
     try { currentCall = null; } catch (e) { }
     try { localStream = null; } catch (e) { }
+    pendingCallVideo = null;
+    pendingTargetPeer = null;
 
     showToast('Call ended');
+}
+
+function attachCallWindowListeners(popup) {
+    if (!popup || !popup.document) return;
+
+    popup.document.getElementById('mute-btn').onclick = () => {
+        const btn = popup.document.getElementById('mute-btn');
+        if (localStream) {
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                btn.classList.toggle('active-toggle', !audioTrack.enabled);
+            }
+        }
+    };
+
+    popup.document.getElementById('audio-out-btn').onclick = async () => {
+        const btn = popup.document.getElementById('audio-out-btn');
+        const videos = popup.document.querySelectorAll('#video-grid video');
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
+            if (audioOutputs.length > 1) {
+                const isEarpiece = btn.classList.toggle('active-toggle');
+                const targetDevice = isEarpiece ? audioOutputs[1].deviceId : audioOutputs[0].deviceId;
+                for (let video of videos) {
+                    if (typeof video.setSinkId === 'function') await video.setSinkId(targetDevice);
+                }
+                popup.showToast(isEarpiece ? 'Switched to Earpiece' : 'Switched to Speaker');
+            } else {
+                popup.showToast('Secondary audio output not found.', 'error');
+            }
+        } catch (err) {
+            console.error('Audio routing error', err);
+            popup.showToast('Audio routing not supported on this browser.', 'error');
+        }
+    };
+
+    popup.document.getElementById('end-call-btn').onclick = () => {
+        endCall();
+    };
+
+    // We skip screen share logic for now or implement if needed
 }
 
 
