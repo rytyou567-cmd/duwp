@@ -57,12 +57,21 @@ const CryptoUtils = {
     },
 
     /**
+     * Helper: Convert ArrayBuffer to Hex String efficiently
+     */
+    bufToHex: (buffer) => {
+        return Array.from(new Uint8Array(buffer))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('');
+    },
+
+    /**
      * Create/Verify Bindings (Strict SHA-256)
      */
     createKeyBinding: async (peerId, pub, ts) => {
         const str = peerId + ts;
         const hash = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
-        return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+        return CryptoUtils.bufToHex(hash);
     },
 
     verifyKeyBinding: async (peerId, pub, ts, binding) => {
@@ -71,7 +80,7 @@ const CryptoUtils = {
 
     generateFingerprint: async (pub) => {
         const hash = await window.crypto.subtle.digest("SHA-256", pub);
-        return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
+        return CryptoUtils.bufToHex(hash).substring(0, 16);
     }
 };
 

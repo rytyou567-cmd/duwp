@@ -1,5 +1,41 @@
 import CryptoUtils from './crypto.js';
 
+// --- LOGGING REDIRECTION ---
+// Explicitly attached to window for cross-module/cross-context access
+window.NexusLog = function (prefix, msg, type = 'info') {
+    const targetWin = window.callWindow;
+
+    // MIRRORING STRATEGY: 
+    // If the window exists but isn't confirmed "ready" by the handshake,
+    // we send to the bridge BUT ALSO fall through to the main console.
+    let redirected = false;
+    if (targetWin && !targetWin.closed) {
+        try {
+            targetWin.postMessage({
+                type: 'POST_LOG',
+                data: { msg: `[${prefix}] ${msg}`, type }
+            }, '*');
+            redirected = true;
+        } catch (e) { }
+    }
+
+    // Only stop here if we are SURE the bridge is ready and handling it
+    if (redirected && window.isCallWindowReady) return;
+
+    // Default: Main window console
+    const styles = {
+        CALL: 'color: #00f2ff; font-weight: bold;',
+        SIGNAL: 'color: #a855f7; font-weight: bold;',
+        MEDIA: 'color: #10b981; font-weight: bold;',
+        UI: 'color: #ffaa00; font-weight: bold;',
+        GROUP: 'color: #4ade80; font-weight: bold;'
+    };
+    console.log(`%c[${prefix}] %c${msg}`, styles[prefix] || 'color: inherit', 'color: inherit');
+};
+
+// Internal alias for module-level calls
+const NexusLog = window.NexusLog;
+
 // --- STATE ---
 let peer = null;
 let myKeyPair = null;
@@ -7,7 +43,8 @@ let myPublicKeyData = null;
 let activePeers = new Map(); // id -> { conn, sharedKey, secure, name }
 let currentPeerId = null;
 let currentGroupId = null;
-let messages = [];
+const messageStore = new Map(); // targetId -> Array of messages
+
 let groups = new Map();
 let localNickname = localStorage.getItem('nexus_nickname') || '';
 let localStream = null;
@@ -27,7 +64,7 @@ const beamModels = new Map(); // targetId -> monaco model
 
 // Call State
 let currentCall = null;
-let callWindow = null;
+window.callWindow = null; // Ensure global definition
 
 // --- INITIALIZATION ---
 async function init() {
@@ -36,7 +73,7 @@ async function init() {
 
     if (!isSecure) {
         document.getElementById('insecure-protocol-overlay').classList.add('active');
-        console.error('HTTPS Enforcement: Execution halted on insecure origin.');
+        NexusLog('INIT', 'HTTPS Enforcement: Execution halted on insecure origin.', 'error');
         return; // Halt all initialization
     }
 
@@ -48,7 +85,7 @@ async function init() {
             myPublicKeyData = await CryptoUtils.exportPublicKey(myKeyPair.publicKey);
         }
     } catch (err) {
-        console.error('FATAL_CRYPTO_ERROR:', err);
+        NexusLog('CRYPTO', 'FATAL_CRYPTO_ERROR: ' + err, 'error');
         showToast('FATAL ERROR: Encryption engine failed. Neural Link suspended.', 'error');
         // We'll proceed with Peer initialization so the UI stays up, but communications will fail
     }
@@ -83,7 +120,7 @@ function initPeer() {
     });
 
     peer.on('error', (err) => {
-        console.error('Peer Error:', err);
+        NexusLog('PEER', 'Peer Error: ' + err, 'error');
         showToast(`Mesh Error: ${err.type}`, 'error');
     });
 }
@@ -105,9 +142,12 @@ function getSharedGroups(targetPeerId) {
     return shared;
 }
 
-function syncHandshakeGroups(data) {
+function syncHandshakeGroups(data, peerId) {
+    const p = activePeers.get(peerId);
     if (data.joinedNexus && Array.isArray(data.joinedNexus)) {
-        console.log(`[GROUP] Handshake Sync: Processing ${data.joinedNexus.length} shared groups`);
+        if (p && p.groupsProcessed) return; // Deduplicate
+
+        NexusLog('GROUP', `Handshake Sync: Processing ${data.joinedNexus.length} shared groups`);
         data.joinedNexus.forEach(g => {
             if (!groups.has(g.groupId)) {
                 groups.set(g.groupId, {
@@ -116,10 +156,11 @@ function syncHandshakeGroups(data) {
                     admins: new Set(g.admins || []),
                     members: new Set(g.members || [])
                 });
-                console.log(`[GROUP] Auto-joined ${g.name} via handshake`);
+                NexusLog('GROUP', `Auto-joined ${g.name} via handshake`);
                 showToast(`Nexus Link Established: ${g.name}`, 'info');
             }
         });
+        if (p) p.groupsProcessed = true;
     }
 }
 
@@ -142,7 +183,7 @@ async function setupConnection(conn) {
 
         // Start Handshake (Only if our own identity is secure)
         if (!myPublicKeyData) {
-            console.error('HANDSHAKE_HALTED: Our encryption engine is not initialized.');
+            NexusLog('HANDSHAKE', 'HANDSHAKE_HALTED: Our encryption engine is not initialized.', 'error');
             return;
         }
 
@@ -209,7 +250,7 @@ async function handleIncomingData(peerId, data) {
             p.secure = true;
             if (data.publicKey) p.publicKey = data.publicKey;
             if (data.nickname) p.nickname = data.nickname;
-            syncHandshakeGroups(data); // Process groups from the responder
+            syncHandshakeGroups(data, peerId); // Process groups from the responder
             showToast(`Secure link with ${p.nickname || peerId} established`);
             if (currentPeerId === peerId) {
                 document.getElementById('active-peer-name').textContent = p.nickname || peerId;
@@ -234,27 +275,27 @@ async function handleIncomingData(peerId, data) {
             handleCallSignaling(peerId, data);
             break;
         case 'GROUP_INVITE':
-            console.log('RECV: GROUP_INVITE', data);
+            NexusLog('GROUP', `RECV: GROUP_INVITE for ${data.groupId} from ${peerId}`);
             handleGroupInvite(peerId, data);
             break;
         case 'GROUP_JOIN_REQ':
-            console.log('RECV: GROUP_JOIN_REQ', data);
+            NexusLog('GROUP', `RECV: GROUP_JOIN_REQ for ${data.groupId} from ${peerId}`);
             handleGroupJoinReq(peerId, data);
             break;
         case 'GROUP_JOIN_RES':
-            console.log('RECV: GROUP_JOIN_RES', data);
+            NexusLog('GROUP', `RECV: GROUP_JOIN_RES for ${data.groupId} from ${peerId}`);
             handleGroupJoinRes(peerId, data);
             break;
         case 'GROUP_UPDATE':
-            console.log('RECV: GROUP_UPDATE', data);
+            NexusLog('GROUP', `RECV: GROUP_UPDATE for ${data.groupId} from ${peerId}`);
             handleGroupUpdate(peerId, data);
             break;
         case 'GROUP_DELETE':
-            console.log('RECV: GROUP_DELETE', data);
+            NexusLog('GROUP', `RECV: GROUP_DELETE for ${data.groupId} from ${peerId}`);
             handleGroupDelete(peerId, data);
             break;
         case 'GROUP_KICK':
-            console.log('RECV: GROUP_KICK', data);
+            NexusLog('GROUP', `RECV: GROUP_KICK for ${data.groupId} from ${peerId}`);
             handleGroupKick(peerId, data);
             break;
         case 'GROUP_MSG':
@@ -399,7 +440,7 @@ function createGroup(existingGroupId = null) {
 
 async function handleGroupInvite(fromId, data) {
     const { groupId, groupName, ownerId, isCreatorInvite } = data;
-    console.log(`[GROUP] Handling invite for ${groupName} (${groupId}) FROM ${fromId} (Auto: ${!!isCreatorInvite})`);
+    NexusLog('GROUP', `Handling invite for ${groupName} (${groupId}) FROM ${fromId} (Auto: ${!!isCreatorInvite})`);
 
     // Auto-accept if it's a direct invitation from the creator/admin
     const autoAccept = isCreatorInvite || false;
@@ -410,7 +451,7 @@ async function handleGroupInvite(fromId, data) {
     if (proceed) {
         const p = activePeers.get(fromId);
         if (p?.secure && p.sharedKey) {
-            console.log('[GROUP] Sending GROUP_JOIN_REQ...');
+            NexusLog('GROUP', 'Sending GROUP_JOIN_REQ...');
             p.conn.send({
                 type: 'GROUP_JOIN_REQ',
                 groupId,
@@ -423,7 +464,7 @@ async function handleGroupInvite(fromId, data) {
                 showToast('Acknowledging invite...');
             }
         } else {
-            console.error('[GROUP] Insecure or missing connection to inviter');
+            NexusLog('GROUP', 'Insecure or missing connection to inviter', 'error');
             if (!autoAccept) showToast('Secure link required to join Nexus', 'error');
         }
     }
@@ -431,17 +472,17 @@ async function handleGroupInvite(fromId, data) {
 
 async function handleGroupJoinReq(fromId, data) {
     const { groupId, requesterId, isInviteAccept } = data;
-    console.log(`[GROUP] Join Request for ${groupId} from ${requesterId} (via ${fromId})`);
+    NexusLog('GROUP', `Join Request for ${groupId} from ${requesterId} (via ${fromId})`);
     const g = groups.get(groupId);
     if (!g) {
-        console.error('[GROUP] Unknown group ID in join req');
+        NexusLog('GROUP', 'Unknown group ID in join req', 'error');
         return;
     }
 
     // Check if user is admin or owner
     const isAuthority = g.admins.has(peer.id) || g.owner === peer.id;
     if (!isAuthority) {
-        console.warn('[GROUP] Non-authority received join req');
+        NexusLog('GROUP', 'Non-authority received join req', 'warn');
         return;
     }
 
@@ -450,7 +491,7 @@ async function handleGroupJoinReq(fromId, data) {
     const approved = isInviteAccept || confirm(`${requesterName} wants to join "${g.name}". Approve entry?`);
 
     if (approved) {
-        console.log(`[GROUP] Approving join for ${requesterId}`);
+        NexusLog('GROUP', `Approving join for ${requesterId}`);
         g.members.add(requesterId);
 
         // Notify the requester FIRST
@@ -465,9 +506,9 @@ async function handleGroupJoinReq(fromId, data) {
                 adminIds: Array.from(g.admins),
                 memberIds: Array.from(g.members)
             });
-            console.log('[GROUP] Sent approved response');
+            NexusLog('GROUP', 'Sent approved response');
         } else {
-            console.error('[GROUP] Cannot find secure connection for response');
+            NexusLog('GROUP', 'Cannot find secure connection for response', 'error');
         }
 
         // THEN Sync updated group state to all current members
@@ -482,11 +523,11 @@ async function handleGroupJoinReq(fromId, data) {
 }
 
 function handleGroupJoinRes(fromId, data) {
-    console.log(`[GROUP] Received Join Response FROM ${fromId}:`, data);
+    NexusLog('GROUP', `Received Join Response FROM ${fromId}: ${JSON.stringify(data)}`);
     if (data.status === 'approved') {
         const { groupId, groupName, ownerId, adminIds, memberIds } = data;
         if (!groupId || !groupName) {
-            console.error('[GROUP] Invalid data in JOIN_RES');
+            NexusLog('GROUP', 'Invalid data in JOIN_RES', 'error');
             return;
         }
 
@@ -497,11 +538,11 @@ function handleGroupJoinRes(fromId, data) {
             members: new Set(memberIds || [peer.id])
         });
 
-        console.log(`[GROUP] Successfully set group ${groupId}. Total groups:`, groups.size);
+        NexusLog('GROUP', `Successfully set group ${groupId}. Total groups: ${groups.size}`);
         showToast(`Secure Nexus Established: ${groupName}`);
         updateSidebar();
     } else {
-        console.warn(`[GROUP] Join denied for ${data.groupId}`);
+        NexusLog('GROUP', `Join denied for ${data.groupId}`, 'warn');
         showToast(`Nexus authorization denied by Authority`, 'error');
     }
 }
@@ -560,7 +601,7 @@ function handleGroupUpdate(fromId, data) {
     if (members) {
         members.forEach(mid => {
             if (mid !== peer.id && !activePeers.has(mid)) {
-                console.log('Nexus discovery: connecting to peer', mid);
+                NexusLog('PEER', 'Nexus discovery: connecting to peer ' + mid);
                 const conn = peer.connect(mid);
                 setupConnection(conn);
             }
@@ -874,13 +915,15 @@ document.addEventListener('click', (e) => {
     }
 });
 
+// Initialization signal moved to call.html to ensure execution order
+
 async function handleHandshake(peerId, data) {
     const p = activePeers.get(peerId);
     if (!p) return;
 
     // Hard Security: Guard against uninitialized local node
     if (!myKeyPair || !myPublicKeyData) {
-        console.error('HANDSHAKE_REJECTED: Our encryption engine is not initialized.');
+        NexusLog('HANDSHAKE', 'HANDSHAKE_REJECTED: Our encryption engine is not initialized.', 'error');
         p.conn.close();
         return;
     }
@@ -888,7 +931,7 @@ async function handleHandshake(peerId, data) {
     // Verify peer's identity binding
     const isValid = await CryptoUtils.verifyKeyBinding(data.peerId, data.publicKey, data.timestamp, data.binding);
     if (!isValid) {
-        console.error('MITM Detect: Invalid key binding from ' + peerId);
+        NexusLog('HANDSHAKE', 'MITM Detect: Invalid key binding from ' + peerId, 'error');
         p.conn.close();
         return;
     }
@@ -899,7 +942,7 @@ async function handleHandshake(peerId, data) {
         p.publicKey = data.publicKey;
 
         // Process any group memberships sent in handshake
-        syncHandshakeGroups(data);
+        syncHandshakeGroups(data, peerId);
 
         // Store remote nickname
         if (data.nickname) p.nickname = data.nickname;
@@ -928,7 +971,7 @@ async function handleHandshake(peerId, data) {
             updatePeerList();
         }
     } catch (err) {
-        console.error('HANDSHAKE_FAILED:', err.message);
+        NexusLog('HANDSHAKE', 'HANDSHAKE_FAILED: ' + err.message, 'error');
         p.conn.close();
         showToast('Secure Handshake Failed: Integrity mismatch', 'error');
     }
@@ -960,7 +1003,7 @@ async function sendMessage() {
             addMessage(peer.id, currentPeerId, text, 'sent');
             input.value = '';
         } catch (err) {
-            console.error(err);
+            NexusLog('MESSAGE', 'Encryption failure: ' + err, 'error');
             showToast('Encryption failure', 'error');
         }
     } else {
@@ -969,9 +1012,40 @@ async function sendMessage() {
 }
 
 function addMessage(from, to, text, type, groupId = null) {
+    const targetId = groupId || (type === 'sent' ? to : from);
     const msg = { from, to, text, time: new Date().toLocaleTimeString(), type, groupId };
-    messages.push(msg);
-    renderMessages();
+
+    if (!messageStore.has(targetId)) {
+        messageStore.set(targetId, []);
+    }
+    messageStore.get(targetId).push(msg);
+
+    // If this is the active conversation, append to UI immediately
+    if (targetId === (currentGroupId || currentPeerId)) {
+        appendMessageToUI(msg);
+    }
+}
+
+function appendMessageToUI(m) {
+    const container = document.getElementById('messages-container');
+    if (!container) return;
+
+    const div = document.createElement('div');
+    div.className = `message ${m.type}`;
+
+    let fromDisplayName = m.from;
+    if (m.type === 'received') {
+        const p = activePeers.get(m.from);
+        if (p?.nickname) fromDisplayName = p.nickname;
+    }
+
+    div.innerHTML = `
+        ${m.groupId && m.type === 'received' ? `<small style="color: var(--accent-cyan); display: block; margin-bottom: 5px;">${fromDisplayName}</small>` : ''}
+        <div class="text">${escapeHtml(m.text)}</div>
+        <small style="font-size: 0.7rem; opacity: 0.5; display: block; margin-top: 5px;">${m.time}</small>
+    `;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
 }
 
 // --- CALLING (DIALER SYSTEM) ---
@@ -982,18 +1056,21 @@ let activeCallState = {
     isAudioOnly: true
 };
 
-async function startCall(video = true) {
+async function startCall(video = false) { // Default to audio-only as requested
+    NexusLog('CALL', `Step 1: Initiating ${video ? 'Video' : 'Audio'} call to: ${currentPeerId}`);
     if (!currentPeerId) {
         showToast('Select a peer to call', 'warning');
         return;
     }
     const p = activePeers.get(currentPeerId);
     if (!p || !p.secure) {
+        NexusLog('CALL', 'Step 1.1: Verification FAILED - Secure link required.', 'error');
         showToast('Secure link required for calls', 'error');
         return;
     }
 
     if (activeCallState.status !== 'idle') {
+        NexusLog('CALL', `Step 1.1: Verification FAILED - State is [${activeCallState.status}]. Ignoring startCall.`, 'warn');
         showToast('You are already in a call.', 'warning');
         return;
     }
@@ -1002,32 +1079,51 @@ async function startCall(video = true) {
         peerId: currentPeerId,
         status: 'calling',
         direction: 'outbound',
-        isAudioOnly: !video
+        isAudioOnly: !video,
+        uiFinalized: false,
+        localVideoActive: false,
+        remoteVideoActive: video
     };
+    if (p.fingerprint) activeCallState.fingerprint = p.fingerprint;
 
-    // Show Outgoing UI
-    document.getElementById('outgoing-target-avatar').textContent = (p.nickname || currentPeerId).charAt(0).toUpperCase();
-    document.getElementById('outgoing-target-name').textContent = p.nickname || currentPeerId;
-    document.getElementById('outgoing-call-status').textContent = `Calling...`;
+    NexusLog('CALL', 'Step 2: Transitioned state to [calling]. Preparing Popup Context.');
     document.getElementById('outgoing-call-overlay').classList.add('active');
 
     // Synchronous Tab Opening
-    if (!callWindow || callWindow.closed) {
+    if (!window.callWindow || window.callWindow.closed) {
+        NexusLog('CALL', 'Step 3: Opening call window popup (window.open)');
         isCallWindowReady = false;
-        callWindow = window.open('call.html', '_blank');
+        window.callWindow = window.open('call.html', '_blank');
+
+        if (!window.callWindow) {
+            NexusLog('CALL', 'FATAL: Popup was blocked by browser. Please allow popups.', 'error');
+            showToast('Popup blocked! Please allow popups for calls.', 'error');
+            return;
+        }
+        NexusLog('CALL', 'Step 3.1: window.open executed. Bridge initialized.');
+    } else {
+        NexusLog('CALL', 'Step 3: Reusing existing call window.');
     }
 
-    // Send Offer Signal
-    p.conn.send({ type: 'CALL_OFFER', video });
+    playRingtone('dialing');
+
+    NexusLog('CALL', 'Step 4: Sending CALL_OFFER signal to peer.');
+    p.conn.send({
+        type: 'CALL_OFFER',
+        video: video
+    });
 }
 
-function handleCallSignaling(peerId, data) {
+async function handleCallSignaling(peerId, data) {
     const p = activePeers.get(peerId);
     if (!p) return;
+
+    NexusLog('SIGNAL', `Incoming ${data.type} from ${peerId}`);
 
     switch (data.type) {
         case 'CALL_OFFER':
             if (activeCallState.status !== 'idle') {
+                NexusLog('SIGNAL', 'Busy, rejecting incoming offer', 'warn');
                 p.conn.send({ type: 'CALL_BUSY' });
                 return;
             }
@@ -1035,59 +1131,92 @@ function handleCallSignaling(peerId, data) {
                 peerId: peerId,
                 status: 'ringing',
                 direction: 'inbound',
-                isAudioOnly: !data.video
+                isAudioOnly: !data.video,
+                uiFinalized: false,
+                localVideoActive: false,
+                remoteVideoActive: data.video
             };
             // Send Ringing Signal
             p.conn.send({ type: 'CALL_RINGING' });
+            playRingtone('ringing');
 
             // Show Incoming UI
             document.getElementById('incoming-caller-avatar').textContent = (p.nickname || peerId).charAt(0).toUpperCase();
             document.getElementById('incoming-caller-name').textContent = p.nickname || peerId;
             document.getElementById('incoming-call-type').textContent = `Incoming ${data.video ? 'Video' : 'Audio'} Link...`;
             document.getElementById('incoming-call-overlay').classList.add('active');
+
+            if (p.fingerprint) activeCallState.fingerprint = p.fingerprint;
+            break;
+
+        case 'CALL_READY':
+            NexusLog('SIGNAL', `Step 1: Received CALL_READY (Handshake peer-side verified) from ${peerId}`);
+            activeCallState.remoteReady = true;
+            if (activeCallState.localReady) {
+                NexusLog('SIGNAL', 'Step 2: Local and Remote are both READY. Finalizing UI.');
+                finalizeCallUI();
+            } else {
+                NexusLog('SIGNAL', 'Step 2: Remote is READY, awaiting local readiness signal.');
+            }
+            break;
+
+        case 'CALL_MUTE_STATE':
+            NexusLog('SIGNAL', `Peer ${peerId} mute state: ${data.isMuted}`);
+            if (window.callWindow && !window.callWindow.closed) {
+                const ind = window.callWindow.document.getElementById('remote-mute-indicator');
+                if (ind) ind.classList.toggle('hidden', !data.isMuted);
+            }
             break;
 
         case 'CALL_RINGING':
+            NexusLog('SIGNAL', `Step 1: Received CALL_RINGING signal from ${peerId}`);
             if (activeCallState.status === 'calling' && activeCallState.peerId === peerId) {
+                NexusLog('SIGNAL', 'Step 2: Transitioned state to [Ringing]. Updating UI.');
                 document.getElementById('outgoing-call-status').textContent = `Ringing...`;
             }
             break;
 
         case 'CALL_ACCEPT':
+            NexusLog('SIGNAL', `Step 1.1: Received CALL_ACCEPT from ${peerId}`);
             if (activeCallState.status === 'calling' && activeCallState.peerId === peerId) {
+                NexusLog('SIGNAL', 'Step 1.2: Valid Outgoing Call accepted. Transitioning UI.');
                 activeCallState.status = 'active';
                 document.getElementById('outgoing-call-overlay').classList.remove('active');
+                NexusLog('SIGNAL', 'Step 1.3: Outgoing call UI hidden. Initiating media stream.');
                 initiateMediaStream(peerId, !activeCallState.isAudioOnly);
+            } else {
+                NexusLog('SIGNAL', `Step 1.2: CALL_ACCEPT received from ${peerId} but not in 'calling' state for this peer. Current state: ${activeCallState.status}. Ignoring.`, 'warn');
             }
             break;
 
         case 'CALL_REJECT':
         case 'CALL_BUSY':
+            NexusLog('SIGNAL', `Step 1.1: Received ${data.type} from ${peerId}.`);
             if (activeCallState.peerId === peerId) {
+                NexusLog('SIGNAL', `Step 1.2: Call failed: ${data.type}. Ending call.`);
                 showToast(data.type === 'CALL_BUSY' ? 'User is busy' : 'Call declined', 'error');
                 endCall(false);
+            } else {
+                NexusLog('SIGNAL', `Step 1.2: ${data.type} received from ${peerId} but not for the active call. Ignoring.`, 'warn');
             }
             break;
 
         case 'CALL_END':
+            NexusLog('SIGNAL', `Step 1.1: Received CALL_END signal from ${peerId}.`);
             if (activeCallState.peerId === peerId) {
+                NexusLog('SIGNAL', 'Step 1.2: Call termination signal for active call. Ending call locally.');
                 endCall(false);
+            } else {
+                NexusLog('SIGNAL', `Step 1.2: CALL_END received from ${peerId} but not for the active call. Ignoring.`, 'warn');
             }
             break;
 
         case 'CALL_VIDEO_STATE':
+            NexusLog('SIGNAL', `Step 1.1: Received CALL_VIDEO_STATE from ${peerId}: hasVideo=${data.hasVideo}.`);
             if (activeCallState.peerId === peerId) {
-                activeCallState.isAudioOnly = !data.hasVideo;
-                if (callWindow && !callWindow.closed) {
-                    const remoteVideo = callWindow.document.getElementById('remote-video-' + peerId);
-                    if (remoteVideo) {
-                        remoteVideo.style.display = data.hasVideo ? 'block' : 'none';
-                    }
-                    const placeholder = callWindow.document.getElementById('audio-placeholder-' + peerId);
-                    if (placeholder) {
-                        placeholder.style.display = data.hasVideo ? 'none' : 'flex';
-                    }
-                }
+                activeCallState.remoteVideoActive = !!data.hasVideo;
+                const win = await waitForCallWindow();
+                if (win) updateCallLayout(peerId, null, win.document);
             }
             break;
     }
@@ -1096,12 +1225,85 @@ function handleCallSignaling(peerId, data) {
 let callWindowReadyResolver = null;
 let isCallWindowReady = false;
 
+// Message Listener for Call Handshake
+window.addEventListener('message', (event) => {
+    // Relaxed origin check for local context parity
+    if (event.origin !== window.location.origin && event.origin !== 'null') {
+        // console.warn('Blocked message from unknown origin:', event.origin);
+        return;
+    }
+
+    if (event.data.type === 'UI_READY') {
+        const popup = event.source;
+        window.callWindow = popup;
+        isCallWindowReady = true;
+
+        NexusLog('CALL', 'Step 2: Received UI_READY via message event. Triggering POST_INIT.');
+
+        const targetPeer = activePeers.get(activeCallState.peerId);
+
+        // Sanitize state to avoid DataCloneError with MediaStreams
+        const sanitizedState = { ...activeCallState };
+        delete sanitizedState.localStream;
+        delete sanitizedState.remoteStream;
+
+        popup.postMessage({
+            type: 'POST_INIT',
+            data: {
+                peerId: activeCallState.peerId,
+                nickname: targetPeer?.nickname || activeCallState.peerId,
+                initialState: sanitizedState
+            }
+        }, '*');
+
+        // Provision security fingerprint
+        if (activeCallState.fingerprint) {
+            const fpEl = popup.document.getElementById('fingerprint-display');
+            if (fpEl) fpEl.textContent = activeCallState.fingerprint;
+        }
+    }
+});
+
 window.onCallWindowLoaded = (popup) => {
-    callWindow = popup;
+    window.callWindow = popup; // Set immediately to enable logging bridge
+    isCallWindowReady = true; // Fallback: Assume ready if DOM loaded hook fires
+    NexusLog('CALL', 'Step 4: Popup window.opener hook executed. Bridge available.');
+
+    // Fallback: If UI_READY message was missed, initialize anyway
+    setTimeout(() => {
+        if (activeCallState.peerId) {
+            NexusLog('CALL', 'Step 5: Firing POST_INIT fallback from opener hook.');
+            const targetPeer = activePeers.get(activeCallState.peerId);
+
+            // Sanitize state to avoid DataCloneError with MediaStreams
+            const sanitizedState = { ...activeCallState };
+            delete sanitizedState.localStream;
+            delete sanitizedState.remoteStream;
+
+            popup.postMessage({
+                type: 'POST_INIT',
+                data: {
+                    peerId: activeCallState.peerId,
+                    nickname: targetPeer?.nickname || activeCallState.peerId,
+                    initialState: sanitizedState
+                }
+            }, '*');
+        }
+    }, 500); // Give popup scripts a moment to attach listeners
+};
+
+window.onCallUIReady = (popup) => {
+    NexusLog('CALL', 'CallUI initialized and ready');
     isCallWindowReady = true;
+
     if (callWindowReadyResolver) {
         callWindowReadyResolver(popup);
         callWindowReadyResolver = null;
+    }
+
+    // Trigger any pending layout update
+    if (activeCallState.peerId) {
+        updateCallLayout(activeCallState.peerId);
     }
 };
 
@@ -1110,6 +1312,24 @@ window.onCallWindowClosed = () => {
     isCallWindowReady = false;
     endCall(false);
 };
+
+function finalizeCallUI() {
+    if (activeCallState.uiFinalized) return;
+    NexusLog('UI', 'Finalizing call UI - Transitioning to active state');
+
+    if (callWindow && !callWindow.closed) {
+        const status = callWindow.document.getElementById('call-status');
+        if (status) {
+            status.textContent = activeCallState.isAudioOnly ? "Secure Audio Link" : "Secure Neural Link";
+            status.style.opacity = '1';
+            setTimeout(() => {
+                status.style.opacity = '0.5';
+            }, 3000);
+        }
+        activeCallState.uiFinalized = true;
+    }
+}
+
 
 async function waitForCallWindow() {
     if (callWindow && !callWindow.closed && isCallWindowReady) {
@@ -1120,68 +1340,156 @@ async function waitForCallWindow() {
     });
 }
 
+async function optimizeTrackQuality(track, type = 'camera') {
+    if (!track || track.kind !== 'video') return;
+
+    // 1. Set Content Hint for specialized encoding
+    if ('contentHint' in track) {
+        track.contentHint = (type === 'screen') ? 'detail' : 'motion';
+    }
+
+    // 2. Adjust Bitrate if sender exists
+    if (currentCall && currentCall.peerConnection) {
+        const senders = currentCall.peerConnection.getSenders();
+        const sender = senders.find(s => s.track === track);
+        if (sender && sender.getParameters) {
+            try {
+                const parameters = sender.getParameters();
+                if (!parameters.encodings) parameters.encodings = [{}];
+
+                // Target: 5Mbps for screen, 2Mbps for camera
+                parameters.encodings[0].maxBitrate = (type === 'screen') ? 5000000 : 2000000;
+                await sender.setParameters(parameters);
+            } catch (e) {
+                NexusLog('MEDIA', `Bitrate optimization failed: ${e}`, 'warn');
+            }
+        }
+    }
+}
+
+async function updateCallLayout(peerId) {
+    const popup = window.callWindow;
+    if (popup && !popup.closed) {
+        NexusLog('UI', `Syncing state to Call Window via Message Bridge (Peer: ${peerId})`);
+
+        // Remove non-clonable MediaStream objects from the state
+        const sanitizedState = { ...activeCallState };
+        delete sanitizedState.localStream;
+        delete sanitizedState.remoteStream;
+
+        try {
+            popup.postMessage({
+                type: 'POST_UPDATE',
+                data: {
+                    activeCallState: sanitizedState
+                }
+            }, '*');
+        } catch (e) {
+            NexusLog('UI', `Failed to sync state via POST_UPDATE: ${e}`, 'warn');
+        }
+    } else {
+        NexusLog('UI', 'Cannot update layout: CallUI not ready', 'warn');
+    }
+}
+
+function createBlackVideoTrack() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280; // Higher res black track for easier swap
+    canvas.height = 720;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const stream = canvas.captureStream(1);
+    const track = stream.getVideoTracks()[0];
+    track.enabled = false;
+    return track;
+}
+
 async function initiateMediaStream(targetPeerId, video) {
+    NexusLog('MEDIA', `Initiating media stream flow for peer: ${targetPeerId} (Video Requested: ${video})`);
     const popup = await waitForCallWindow();
     const isVideo = video;
 
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+        const constraints = { video: isVideo, audio: true };
+        NexusLog('MEDIA', `Step 1: Requesting user permissions (Video: ${isVideo}, Audio: true) via popup navigator`);
+        localStream = await popup.navigator.mediaDevices.getUserMedia(constraints);
+        NexusLog('MEDIA', 'Step 2: Permissions granted successfully. Local stream acquired.');
+
+        // If audio-only, we didn't request video tracks, so we don't need to disable them.
+        if (activeCallState.isAudioOnly && localStream.getVideoTracks().length > 0) {
+            NexusLog('MEDIA', 'Audio-only mode active: Disabling local video tracks.');
+            localStream.getVideoTracks().forEach(t => {
+                t.enabled = false;
+                NexusLog('MEDIA', `Disabled track: ${t.label}`);
+            });
+        }
+
         if (activeCallState.status === 'idle') {
+            NexusLog('MEDIA', 'Call aborted during permission flow. Cleaning up tracks.');
             localStream.getTracks().forEach(t => t.stop());
             popup.close();
             return;
         }
     } catch (err) {
-        console.warn('Media access denied, falling back to silent stream:', err);
-        showToast('No microphone permission. You are muted.', 'warning');
-
-        // Spawn a silent audio stream to keep WebRTC connections alive
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const dst = ctx.createMediaStreamDestination();
-        const oscillator = ctx.createOscillator();
-        oscillator.connect(dst);
-        oscillator.start();
-
-        localStream = dst.stream;
-        localStream.getAudioTracks()[0].enabled = false;
-
-        const muteBtn = popup.document.getElementById('mute-btn');
-        if (muteBtn) muteBtn.classList.add('active-toggle');
+        NexusLog('MEDIA', `Initial media access error: ${err}. Attempting fallback to audio-only.`, 'warn');
+        try {
+            const audioStream = await popup.navigator.mediaDevices.getUserMedia({ audio: true });
+            NexusLog('MEDIA', 'Fallback: Audio-only permissions granted.');
+            const blackTrack = createBlackVideoTrack();
+            audioStream.addTrack(blackTrack);
+            localStream = audioStream;
+            showToast('Camera access blocked.', 'warning');
+        } catch (e2) {
+            NexusLog('MEDIA', `Total media denial: ${e2}`, 'error');
+            if (popup.showPermissionOverlay) {
+                popup.showPermissionOverlay("Your microphone is blocked. Please allow access in browser settings and retry.");
+            }
+            showToast('Media access denied.', 'error');
+            endCall();
+            return;
+        }
     }
 
     const localVid = popup.document.getElementById('local-video');
     if (localVid) {
         localVid.srcObject = localStream;
         localVid.style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
-        localVid.muted = true; // Never hear yourself
+        localVid.muted = true;
     }
 
+    const visualizerCanvas = popup.document.getElementById('volume-visualizer');
+    if (visualizerCanvas && localStream.getAudioTracks().length > 0) {
+        NexusLog('MEDIA', 'Initializing volume visualizer on popup canvas.');
+        setupVolumeAnalyzer(localStream, visualizerCanvas);
+    }
+
+    NexusLog('MEDIA', 'Step 3: Establishing P2P Media Connection via PeerJS');
     const callTimestamp = Date.now();
     let callToken = "unencrypted";
     if (myPublicKeyData) {
         callToken = await CryptoUtils.createKeyBinding(peer.id, myPublicKeyData, callTimestamp);
     }
     const call = peer.call(targetPeerId, localStream, {
-        metadata: {
-            video: isVideo,
-            secureToken: callToken,
-            timestamp: callTimestamp
-        }
+        metadata: { video: isVideo, secureToken: callToken, timestamp: callTimestamp }
     });
-    setupCallHandlers(call);
 
-    // Attach event listeners to the new window's buttons
+    NexusLog('MEDIA', `Outbound call object created (ID: ${call.connectionId})`);
+    setupCallHandlers(call);
     attachCallWindowListeners(popup);
 
-    popup.document.getElementById('call-status').textContent = isVideo ? 'Video Call' : 'Audio Call';
+    // The popup UI will now update based on POST_UPDATE messages
+    // popup.document.getElementById('call-status').textContent = isVideo ? 'Video Call' : 'Audio Call';
     document.getElementById('outgoing-call-overlay').classList.remove('active');
+    updateCallLayout(targetPeerId); // Sync state to popup
 }
 
 let pendingIncomingCall = null;
 
 async function handleIncomingCall(call) {
+    NexusLog('MEDIA', `Step 1: Received incoming call offer from: ${call.peer}`);
     if (!call.options || !call.options.metadata || !call.options.metadata.secureToken) {
-        console.warn('Rejected incoming stream: Missing encryption binding.');
+        NexusLog('MEDIA', 'FATAL: Rejected stream: Missing encryption metadata.', 'error');
         call.close();
         return;
     }
@@ -1191,103 +1499,151 @@ async function handleIncomingCall(call) {
     const callerPeer = activePeers.get(call.peer);
 
     if (!callerPeer || !callerPeer.secure || !callerPeer.publicKey) {
-        console.warn('Rejected incoming stream: Caller is not a secure peer.');
+        NexusLog('MEDIA', 'FATAL: Rejected stream: Caller is not trusted or link not secure.', 'error');
         call.close();
         return;
     }
 
-    // Verify cryptographic binding
+    NexusLog('MEDIA', 'Step 2: Verifying cryptographic signature of the call token...');
     const isValidCall = await CryptoUtils.verifyKeyBinding(call.peer, callerPeer.publicKey, callTimestamp, secureToken);
     if (!isValidCall || secureToken === "unencrypted") {
-        console.warn('Rejected incoming stream: Invalid peer signature.');
+        NexusLog('MEDIA', 'FATAL: Rejected stream: Signature verification FAILED. MITM potential.', 'error');
         showToast('Blocked unauthorized media stream.', 'error');
         call.close();
         return;
     }
+    NexusLog('MEDIA', 'Step 3: Call signature verified. Proceeding to answer.');
 
-    // We only accept the stream if we've already transitioned to 'active' via Accept button
     if (activeCallState.status === 'active' && activeCallState.peerId === call.peer) {
+        NexusLog('MEDIA', 'Answering call - Awaiting call window availability...');
         const popup = await waitForCallWindow();
-        const isVideo = call.options?.metadata?.video;
+        NexusLog('MEDIA', 'Call window available. Requesting user permissions for answer.');
 
         try {
-            localStream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+            const incomingIsVideo = call.options.metadata && call.options.metadata.video;
+            const constraints = { video: incomingIsVideo, audio: true };
+            NexusLog('MEDIA', `Requesting permissions for answer (Video: ${incomingIsVideo}, Audio: true)`);
+            localStream = await popup.navigator.mediaDevices.getUserMedia(constraints);
+            NexusLog('MEDIA', `Permissions granted for answer (Audio-only: ${!incomingIsVideo})`);
+
             if (activeCallState.status === 'idle') {
+                NexusLog('MEDIA', 'Call aborted during answer flow. Closing tracks.');
                 localStream.getTracks().forEach(t => t.stop());
                 popup.close();
                 return;
             }
         } catch (err) {
-            console.warn('Answer media error, falling back to silent stream:', err);
-            showToast('No microphone permission. You are muted.', 'warning');
-
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const dst = ctx.createMediaStreamDestination();
-            const oscillator = ctx.createOscillator();
-            oscillator.connect(dst);
-            oscillator.start();
-            localStream = dst.stream;
-            localStream.getAudioTracks()[0].enabled = false;
-
-            const muteBtn = popup.document.getElementById('mute-btn');
-            if (muteBtn) muteBtn.classList.add('active-toggle');
+            NexusLog('MEDIA', `Answer media fallback error: ${err}. Trying audio-only fallback.`);
+            try {
+                const audioStream = await popup.navigator.mediaDevices.getUserMedia({ audio: true });
+                NexusLog('MEDIA', 'Fallback: Audio permissions granted for answer.');
+                const blackTrack = createBlackVideoTrack();
+                audioStream.addTrack(blackTrack);
+                localStream = audioStream;
+                showToast('Camera access blocked.', 'warning');
+            } catch (e2) {
+                NexusLog('MEDIA', `Critical answer media failure: ${e2}`, 'error');
+                if (popup.showPermissionOverlay) {
+                    popup.showPermissionOverlay("Media access denied. Please ensure your camera/mic are not in use by another app.");
+                }
+                showToast('Media access denied.', 'error');
+                endCall();
+                return;
+            }
         }
 
         const localVid = popup.document.getElementById('local-video');
         if (localVid) {
             localVid.srcObject = localStream;
-            localVid.style.display = isVideo && localStream.getVideoTracks().length > 0 ? 'block' : 'none';
+            const hasRealCamera = localStream.getVideoTracks().some(t => t.label && !t.label.includes('canvas'));
+            localVid.style.display = (hasRealCamera) ? 'block' : 'none';
             localVid.muted = true;
+            NexusLog('UI', `Attached local stream to popup video element (Display: ${localVid.style.display})`);
         }
 
+        const visualizerCanvas = popup.document.getElementById('volume-visualizer');
+        if (visualizerCanvas && localStream.getAudioTracks().length > 0) {
+            NexusLog('MEDIA', 'Setting up volume visualizer for local audio.');
+            setupVolumeAnalyzer(localStream, visualizerCanvas);
+        }
+
+        NexusLog('MEDIA', 'Step 4: Finalizing P2P answer via PeerJS.');
         call.answer(localStream);
         setupCallHandlers(call);
         attachCallWindowListeners(popup);
 
-        popup.document.getElementById('call-status').textContent = `${isVideo ? 'Video' : 'Audio'} Call in progress`;
+        // The popup UI will now update based on POST_UPDATE messages
+        // popup.document.getElementById('call-status').textContent = `Call in progress`;
+        updateCallLayout(call.peer); // Sync state to popup
     } else {
-        // Unsolicited stream, reject it
+        NexusLog('MEDIA', `Rejecting incoming stream: Active state mismatch (Status: ${activeCallState.status})`, 'warn');
         call.close();
     }
 }
 
 function setupCallHandlers(call) {
     currentCall = call;
-    call.on('stream', (remoteStream) => {
-        const targetDoc = (callWindow && !callWindow.closed) ? callWindow.document : document;
-        const videoGrid = targetDoc.getElementById('video-grid');
-        if (!videoGrid) return; // Prevent crashes if UI isn't ready
+    NexusLog('UI', `Setting up signaling handlers for peer: ${call.peer}`);
 
-        let remoteVideo = targetDoc.getElementById('remote-video-' + call.peer);
-        if (!remoteVideo) {
-            remoteVideo = targetDoc.createElement('video');
-            remoteVideo.id = 'remote-video-' + call.peer;
-            remoteVideo.autoplay = true;
-            remoteVideo.playsInline = true;
-            videoGrid.appendChild(remoteVideo);
-        }
-        remoteVideo.srcObject = remoteStream;
-        remoteVideo.style.display = activeCallState.isAudioOnly ? 'none' : 'block';
+    // Guard against duplicate stream events (PeerJS quirk)
+    let streamProcessed = false;
 
-        let placeholder = targetDoc.getElementById('audio-placeholder-' + call.peer);
-        if (activeCallState.isAudioOnly) {
-            if (!placeholder) {
-                placeholder = targetDoc.createElement('div');
-                placeholder.id = 'audio-placeholder-' + call.peer;
-                placeholder.className = 'audio-avatar';
-                placeholder.innerHTML = `<div class="avatar pulse" style="width:80px;height:80px;font-size:2rem;">${(activePeers.get(call.peer)?.nickname || call.peer).charAt(0).toUpperCase()}</div><h4 style="margin-top:15px;">${activePeers.get(call.peer)?.nickname || call.peer}</h4>`;
-                videoGrid.appendChild(placeholder);
-            }
-            placeholder.style.display = 'flex';
-        } else if (placeholder) {
-            placeholder.style.display = 'none';
+    call.on('stream', async (remoteStream) => {
+        NexusLog('MEDIA', `Base 'stream' event fired for peer: ${call.peer}`);
+        if (streamProcessed) {
+            NexusLog('MEDIA', `Ignoring duplicate stream event for: ${call.peer}`);
+            return;
         }
+        streamProcessed = true;
+
+        NexusLog('MEDIA', `Processing remote stream (Tracks: ${remoteStream.getTracks().length})`);
+        // The popup UI will now update based on POST_UPDATE messages
+        // const targetDoc = await waitForCallWindow().then(win => win.document);
+        // if (!targetDoc) {
+        //     NexusLog('MEDIA', 'ABORT: Call window document not available for stream attachment', 'error');
+        //     return;
+        // }
+
+        // updateCallLayout(call.peer, remoteStream, targetDoc); // No longer passing remoteStream directly
+
+        // Listen for track changes locally
+        remoteStream.getTracks().forEach(track => {
+            NexusLog('MEDIA', `Inspecting track: Kind=${track.kind}, Label=${track.label}, ReadyState=${track.readyState}`);
+            track.onmute = () => {
+                NexusLog('MEDIA', `Remote ${track.kind} track MUTE detected for ${call.peer}`, 'media');
+                updateCallLayout(call.peer);
+            };
+            track.onunmute = () => {
+                NexusLog('MEDIA', `Remote ${track.kind} track UNMUTE detected for ${call.peer}`, 'media');
+                updateCallLayout(call.peer);
+            };
+            track.onended = () => {
+                NexusLog('MEDIA', `Remote ${track.kind} track ENDED for ${call.peer}`, 'media');
+                updateCallLayout(call.peer);
+            };
+        });
+
+        activeCallState.localReady = true;
+        activeCallState.remoteStream = remoteStream; // Store remote stream for popup to access
+
+        // Deduplicate CALL_READY signal
+        if (!activeCallState.readySent) {
+            NexusLog('SIGNAL', 'Sending CALL_READY to peer');
+            const p = activePeers.get(activeCallState.peerId);
+            if (p?.secure) p.conn.send({ type: 'CALL_READY' });
+            activeCallState.readySent = true;
+        }
+
+        if (activeCallState.remoteReady) finalizeCallUI();
+        updateCallLayout(call.peer); // Sync state to popup after stream is processed
     });
 
     call.on('close', () => {
+        NexusLog('MEDIA', 'Remote media connection closed');
         endCall(false);
     });
 }
+
 
 
 
@@ -1296,31 +1652,115 @@ function openCallOverlay() {
     document.getElementById('call-overlay').classList.add('active');
 }
 
+let audioCtx = null;
+let ringtoneOsc = null;
+let ringtoneGain = null;
+
 function playRingtone(type) {
-    // Placeholder for actual Web Audio API integration
-    console.log(`[Audio Debug] Playing ${type} ringtone...`);
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    stopRingtone();
+
+    ringtoneOsc = audioCtx.createOscillator();
+    ringtoneGain = audioCtx.createGain();
+
+    if (type === 'dialing') {
+        ringtoneOsc.type = 'sine';
+        ringtoneOsc.frequency.setValueAtTime(440, audioCtx.currentTime);
+        // Intermittent beeps for dialing
+        ringtoneGain.gain.setValueAtTime(0, audioCtx.currentTime);
+        for (let i = 0; i < 60; i += 2) {
+            ringtoneGain.gain.setValueAtTime(0.05, audioCtx.currentTime + i);
+            ringtoneGain.gain.setValueAtTime(0, audioCtx.currentTime + i + 1.2);
+        }
+    } else {
+        ringtoneOsc.type = 'triangle';
+        ringtoneOsc.frequency.setValueAtTime(550, audioCtx.currentTime);
+        // Warbling effect for ringing
+        for (let i = 0; i < 60; i += 0.5) {
+            ringtoneOsc.frequency.linearRampToValueAtTime(650, audioCtx.currentTime + i + 0.25);
+            ringtoneOsc.frequency.linearRampToValueAtTime(550, audioCtx.currentTime + i + 0.5);
+        }
+        ringtoneGain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+    }
+
+    ringtoneOsc.connect(ringtoneGain);
+    ringtoneGain.connect(audioCtx.destination);
+    ringtoneOsc.start();
 }
 
 function stopRingtone() {
-    // Placeholder for actual Web Audio API integration
-    console.log(`[Audio Debug] Stopping ringtone.`);
+    if (ringtoneOsc) {
+        try { ringtoneOsc.stop(); } catch (e) { }
+        ringtoneOsc.disconnect();
+        ringtoneOsc = null;
+    }
+    if (ringtoneGain) {
+        ringtoneGain.disconnect();
+        ringtoneGain = null;
+    }
 }
 
-function endCall(sendSignal = true) {
-    stopRingtone();
+let volAnalyzer = null;
+let volDataArray = null;
+let volAnimId = null;
 
-    if (sendSignal && (activeCallState.status === 'active' || activeCallState.status === 'calling' || activeCallState.status === 'ringing')) {
-        const p = activePeers.get(activeCallState.peerId);
-        if (p && p.secure && p.sharedKey) {
+function setupVolumeAnalyzer(stream, canvas) {
+    if (callWindow && !callWindow.closed && callWindow.CallUI?.isReady) {
+        callWindow.CallUI.setupVolumeAnalyzer(stream, canvas);
+    }
+}
+
+function stopVolumeAnalyzer() {
+    if (callWindow && !callWindow.closed && callWindow.CallUI?.isReady) {
+        callWindow.CallUI.stopVolumeAnalyzer();
+    }
+}
+
+
+function endCall(sendSignal = true) {
+    if (activeCallState.status === 'idle') return;
+    NexusLog('CALL', `Terminating call. Sending signal: ${sendSignal}`);
+
+    // reset state first to prevent duplicate entries
+    const prevPeerId = activeCallState.peerId;
+    activeCallState = {
+        peerId: null,
+        status: 'idle',
+        direction: null,
+        isAudioOnly: true,
+        groupId: null,
+        uiFinalized: false,
+        remoteVideoActive: false,
+        localMuted: false, // Reset mute state
+        remoteMuted: false, // Reset remote mute state
+        screenSharing: false, // Reset screen sharing state
+        remoteStream: null, // Clear remote stream reference
+        localStream: null // Clear local stream reference
+    };
+
+    stopRingtone();
+    stopVolumeAnalyzer();
+
+    if (sendSignal && prevPeerId) {
+        const p = activePeers.get(prevPeerId);
+        if (p?.secure && p.sharedKey) {
             p.conn.send({ type: 'CALL_END' });
         }
     }
 
-    if (typeof currentCall !== 'undefined' && currentCall) {
+    if (currentCall) {
         try { currentCall.close(); } catch (e) { }
+        currentCall = null;
     }
-    if (typeof localStream !== 'undefined' && localStream) {
-        localStream.getTracks().forEach(t => t.stop());
+
+    if (localStream) {
+        localStream.getTracks().forEach(t => {
+            t.stop();
+            t.enabled = false;
+        });
+        localStream = null;
     }
 
     if (callWindow && !callWindow.closed) {
@@ -1331,35 +1771,36 @@ function endCall(sendSignal = true) {
     document.getElementById('incoming-call-overlay').classList.remove('active');
     document.getElementById('outgoing-call-overlay').classList.remove('active');
 
-    // reset state
-    activeCallState = { peerId: null, status: 'idle', direction: null, isAudioOnly: true, groupId: null };
-    try { currentCall = null; } catch (e) { }
-    try { localStream = null; } catch (e) { }
-    pendingCallVideo = null;
-    pendingTargetPeer = null;
-
     showToast('Call ended');
 }
 
-function attachCallWindowListeners(popup) {
-    if (!popup || !popup.document) return;
+async function toggleMute(forceState = null) {
+    const isMuted = forceState !== null ? forceState : !localStream.getAudioTracks()[0].enabled;
+    localStream.getAudioTracks().forEach(track => track.enabled = !isMuted);
 
-    popup.document.getElementById('mute-btn').onclick = () => {
-        const btn = popup.document.getElementById('mute-btn');
-        if (localStream) {
-            const audioTrack = localStream.getAudioTracks()[0];
-            if (audioTrack) {
-                audioTrack.enabled = !audioTrack.enabled;
-                btn.classList.toggle('active-toggle', !audioTrack.enabled);
-            }
-        }
-    };
+    NexusLog('MEDIA', `Microphone ${isMuted ? 'MUTED' : 'UNMUTED'}`);
 
-    popup.document.getElementById('audio-out-btn').onclick = async () => {
-        const btn = popup.document.getElementById('audio-out-btn');
-        const videos = popup.document.querySelectorAll('#video-grid video');
+    // Sync to peer
+    const p = activePeers.get(activeCallState.peerId);
+    if (p && p.secure) {
+        p.conn.send({ type: 'CALL_MUTE_STATE', isMuted: isMuted });
+    }
+
+    // Update activeCallState and sync to popup
+    activeCallState.localMuted = isMuted;
+    updateCallLayout(activeCallState.peerId);
+}
+
+// --- NEXUS CALL API for POPUP ---
+window.NexusCall = {
+    end: () => endCall(),
+    toggleMute: toggleMute, // Reference the new standalone function
+    toggleAudioOutput: async (btn) => {
+        const popup = callWindow;
+        if (!popup) return;
+        const videos = popup.document.querySelectorAll('video');
         try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
+            const devices = await popup.navigator.mediaDevices.enumerateDevices();
             const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
             if (audioOutputs.length > 1) {
                 const isEarpiece = btn.classList.toggle('active-toggle');
@@ -1368,94 +1809,127 @@ function attachCallWindowListeners(popup) {
                     if (typeof video.setSinkId === 'function') await video.setSinkId(targetDevice);
                 }
                 popup.showToast(isEarpiece ? 'Switched to Earpiece' : 'Switched to Speaker');
+                activeCallState.audioOutputEarpiece = isEarpiece; // Update state
             } else {
                 popup.showToast('Secondary audio output not found.', 'error');
             }
         } catch (err) {
-            console.error('Audio routing error', err);
+            NexusLog('UI', `Audio routing error: ${err}`, 'error');
             popup.showToast('Audio routing not supported on this browser.', 'error');
         }
-    };
-
-    popup.document.getElementById('end-call-btn').onclick = () => {
-        endCall();
-    };
-
-    popup.document.getElementById('share-screen-btn').onclick = async () => {
-        const btn = popup.document.getElementById('share-screen-btn');
+        updateCallLayout(activeCallState.peerId); // Sync state to popup
+    },
+    toggleScreenShare: async (btn) => {
+        const popup = callWindow;
+        if (!popup) return;
 
         if (btn.classList.contains('active-screen')) {
-            // Stop screen sharing and revert to camera
             try {
-                let newStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                btn.disabled = true;
+                let newStream = await popup.navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 replaceCallStream(newStream, popup);
                 btn.classList.remove('active-screen');
 
-                // Preserve mute state
-                const muteBtn = popup.document.getElementById('mute-btn');
-                const isMuted = muteBtn.classList.contains('active-toggle');
-                newStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+                // const muteBtn = popup.document.getElementById('mute-btn'); // No longer needed, use activeCallState
+                // const isMuted = muteBtn.classList.contains('active-toggle');
+                newStream.getAudioTracks().forEach(t => t.enabled = !activeCallState.localMuted); // Use activeCallState.localMuted
 
-                showToast('Screen sharing stopped');
+                const p = activePeers.get(activeCallState.peerId);
+                if (p?.conn) p.conn.send({ type: 'CALL_VIDEO_STATE', hasVideo: false });
+                activeCallState.screenSharing = false; // Update state
+                popup.showToast('Screen sharing stopped');
             } catch (err) {
-                console.error('Revert to camera failed', err);
-                showToast('Failed to access camera', 'error');
+                NexusLog('UI', `Revert to camera failed: ${err}`, 'error');
+                popup.showToast('Failed to access camera', 'error');
+            } finally {
+                btn.disabled = false;
             }
             return;
         }
 
-        // Start screen sharing
         try {
-            const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+            btn.disabled = true;
+            const screenStream = await popup.navigator.mediaDevices.getDisplayMedia({
+                video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
+            });
 
-            // Keep microphone audio if present
             const audioTracks = localStream ? localStream.getAudioTracks() : [];
-            if (audioTracks.length > 0) {
-                screenStream.addTrack(audioTracks[0]);
-            }
+            if (audioTracks.length > 0) screenStream.addTrack(audioTracks[0]);
 
             replaceCallStream(screenStream, popup);
+            const vTrack = screenStream.getVideoTracks()[0];
+            await optimizeTrackQuality(vTrack, 'screen');
             btn.classList.add('active-screen');
-            showToast('Screen sharing started');
+            popup.showToast('High-Def screen sharing active');
 
-            // Handle browser-level "Stop sharing" button
-            screenStream.getVideoTracks()[0].onended = async () => {
+            const p = activePeers.get(activeCallState.peerId);
+            if (p?.conn) p.conn.send({ type: 'CALL_VIDEO_STATE', hasVideo: true });
+
+            vTrack.onended = () => {
                 if (btn.classList.contains('active-screen')) {
-                    btn.click();
+                    NexusCall.toggleScreenShare(btn);
                 }
             };
         } catch (err) {
-            console.error('Screen sharing failed', err);
-            showToast('Could not share screen', 'error');
+            NexusLog('UI', `Screen sharing failed: ${err}`, 'error');
+            popup.showToast('Could not share screen', 'error');
+        } finally {
+            btn.disabled = false;
         }
-    };
+    }
+};
+
+function attachCallWindowListeners(popup) {
+    // Legacy support: Now handled by CallUI.init()
+    NexusLog('CALL', 'attachCallWindowListeners - Redundant but kept for safety');
 }
 
 function replaceCallStream(newStream, popup) {
     if (!currentCall || !currentCall.peerConnection) return;
 
-    // Stop old video tracks
-    const oldVideoTracks = localStream ? localStream.getVideoTracks() : [];
-    oldVideoTracks.forEach(t => t.stop());
+    // Stop old video tracks to release the camera immediately
+    if (localStream) {
+        localStream.getVideoTracks().forEach(t => t.stop());
+    }
 
-    // Update local video element
-    const localVid = popup ? popup.document.getElementById('local-video') : document.getElementById('local-video');
+    // Update local video element in the popup
+    const localVid = popup ? popup.document.getElementById('local-video') : null;
     if (localVid) {
         localVid.srcObject = newStream;
         localVid.style.display = newStream.getVideoTracks().length > 0 ? 'block' : 'none';
         localVid.muted = true;
     }
 
+    // Update Visualizer if we have audio and a canvas
+    if (popup) {
+        const visualizerCanvas = popup.document.getElementById('volume-visualizer');
+        if (visualizerCanvas) {
+            stopVolumeAnalyzer();
+            if (newStream.getAudioTracks().length > 0) {
+                setupVolumeAnalyzer(newStream, visualizerCanvas);
+            }
+        }
+    }
+
     // Replace tracks in the WebRTC peer connection
     const senders = currentCall.peerConnection.getSenders();
-
-    // Replace video track
     const videoTrack = newStream.getVideoTracks()[0];
+    const audioTrack = newStream.getAudioTracks()[0];
+
+    // Priority 1: Replace existing video sender (SHOULD always exist now due to Black Track strategy)
     const videoSender = senders.find(s => s.track && s.track.kind === 'video');
     if (videoSender && videoTrack) {
-        videoSender.replaceTrack(videoTrack).catch(e => console.error("Replace video track error", e));
-    } else if (!videoSender && videoTrack) {
+        NexusLog('MEDIA', "Video sender found, replacing track...");
+        videoSender.replaceTrack(videoTrack).catch(e => NexusLog('MEDIA', `Replace video track error: ${e}`, 'error'));
+    } else if (videoTrack) {
+        NexusLog('MEDIA', "No video sender found! Attempting addTrack fallback...", 'warn');
         currentCall.peerConnection.addTrack(videoTrack, newStream);
+    }
+
+    // Replace audio track as well to ensure continuity
+    const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
+    if (audioSender && audioTrack) {
+        audioSender.replaceTrack(audioTrack).catch(e => NexusLog('MEDIA', `Replace audio track error: ${e}`, 'error'));
     }
 
     localStream = newStream;
@@ -1463,7 +1937,8 @@ function replaceCallStream(newStream, popup) {
     // Signal the remote side about the video state change
     const p = activePeers.get(activeCallState.peerId);
     if (p && p.secure && p.sharedKey) {
-        p.conn.send({ type: 'CALL_VIDEO_STATE', hasVideo: newStream.getVideoTracks().length > 0 });
+        const hasVideo = newStream.getVideoTracks().some(t => t.enabled);
+        p.conn.send({ type: 'CALL_VIDEO_STATE', hasVideo: hasVideo });
     }
 }
 
@@ -1616,6 +2091,50 @@ function setupEventListeners() {
             if (view === 'hub') renderHubs();
         };
     });
+
+    // Sidebar Delegation
+    document.getElementById('peer-list').onclick = (e) => {
+        const card = e.target.closest('.peer-card');
+        if (!card) return;
+        const id = card.dataset.id;
+        const p = activePeers.get(id);
+        if (!p) return;
+
+        currentPeerId = id;
+        currentGroupId = null;
+        document.getElementById('active-peer-name').textContent = p.nickname || id;
+        document.getElementById('active-peer-status').textContent = p.secure ? 'End-to-End Encrypted' : 'Establishing link...';
+
+        updateBeamTarget();
+        updateSidebar();
+        renderMessages();
+    };
+
+    document.getElementById('group-list').onclick = (e) => {
+        const card = e.target.closest('.peer-card');
+        const settingsBtn = e.target.closest('.settings-trigger');
+
+        if (settingsBtn) {
+            const gid = card.dataset.id;
+            openNexusSettings(gid);
+            return;
+        }
+
+        if (card) {
+            const id = card.dataset.id;
+            const g = groups.get(id);
+            if (!g) return;
+
+            currentGroupId = id;
+            currentPeerId = null;
+            document.getElementById('active-peer-name').textContent = g.name;
+            document.getElementById('active-peer-status').textContent = 'Secure Nexus Network';
+
+            updateBeamTarget();
+            updateSidebar();
+            renderMessages();
+        }
+    };
 
     // Call Actions
     document.getElementById('voice-call-btn').onclick = () => startCall(false);
@@ -1886,75 +2405,78 @@ function updateSidebar() {
 }
 
 function updatePeerList() {
-    const list = document.getElementById('peer-list');
-    list.innerHTML = '';
+    const container = document.getElementById('peer-list');
+    if (!container) return;
+
+    // Remove orphaned cards
+    Array.from(container.children).forEach(child => {
+        if (!activePeers.has(child.dataset.id)) child.remove();
+    });
+
     activePeers.forEach((p, id) => {
+        let card = container.querySelector(`[data-id="${id}"]`);
         const displayName = p.nickname || id;
-        const card = document.createElement('div');
-        card.className = `peer-card ${currentPeerId === id ? 'active' : ''}`;
+        const isActive = currentPeerId === id;
+        const statusText = p.secure ? '🔒 E2EE Active' : '⌛ Handshake...';
+        const statusColor = p.secure ? 'var(--accent-cyan)' : 'var(--text-dim)';
+
+        if (!card) {
+            card = document.createElement('div');
+            card.dataset.id = id;
+            container.appendChild(card);
+        }
+
+        card.className = `peer-card ${isActive ? 'active' : ''}`;
         card.innerHTML = `
             <div class="avatar">${displayName[0].toUpperCase()}</div>
             <div class="peer-info" style="flex: 1">
                 <strong>${displayName}</strong>
-                <small style="color: ${p.secure ? 'var(--accent-cyan)' : 'var(--text-dim)'}">
-                    ${p.secure ? '🔒 E2EE Active' : '⌛ Handshake...'}
-                </small>
+                <small style="color: ${statusColor}">${statusText}</small>
             </div>
         `;
-        card.onclick = () => {
-            currentPeerId = id;
-            currentGroupId = null;
-            document.getElementById('active-peer-name').textContent = p.nickname || id;
-            document.getElementById('active-peer-status').textContent = p.secure ? 'End-to-End Encrypted' : 'Establishing link...';
-
-            // Sync Beam Target Indicator
-            updateBeamTarget();
-
-            updateSidebar();
-            renderMessages();
-        };
-        list.appendChild(card);
     });
 }
 
 function updateGroupList() {
-    const list = document.getElementById('group-list');
-    list.innerHTML = '';
+    const container = document.getElementById('group-list');
+    if (!container) return;
 
     if (groups.size === 0) {
-        list.innerHTML = '<div style="padding: 15px 20px; color: var(--text-dim); font-size: 0.8rem; opacity: 0.5;">No active Nexus links...</div>';
+        container.innerHTML = '<div style="padding: 15px 20px; color: var(--text-dim); font-size: 0.8rem; opacity: 0.5;">No active Nexus links...</div>';
         return;
     }
 
-    groups.forEach((g, id) => {
-        const card = document.createElement('div');
-        card.className = `peer-card ${currentGroupId === id ? 'active' : ''}`;
-        card.style.borderColor = 'var(--accent-purple)';
+    // Clean up empty state if it exists
+    if (container.querySelector('div[style*="opacity: 0.5"]')) container.innerHTML = '';
 
-        // Defensive size check
+    // Remove orphaned cards
+    Array.from(container.children).forEach(child => {
+        if (child.dataset.id && !groups.has(child.dataset.id)) child.remove();
+    });
+
+    groups.forEach((g, id) => {
+        let card = container.querySelector(`[data-id="${id}"]`);
+        const isActive = currentGroupId === id;
         const memberCount = g.members ? g.members.size : 0;
 
+        if (!card) {
+            card = document.createElement('div');
+            card.dataset.id = id;
+            container.appendChild(card);
+        }
+
+        card.className = `peer-card ${isActive ? 'active' : ''}`;
+        card.style.borderColor = 'var(--accent-purple)';
         card.innerHTML = `
             <div class="avatar" style="background: var(--accent-purple)">G</div>
             <div class="peer-info" style="flex: 1">
                 <strong>${g.name || 'Unknown Nexus'}</strong>
                 <small style="color: var(--text-dim)">${memberCount} Nodes</small>
             </div>
-            <button class="action-btn" style="padding: 5px; margin: 0; background: transparent; opacity: 0.7;" onclick="event.stopPropagation(); openNexusSettings('${id}')">
+            <button class="action-btn settings-trigger" style="padding: 5px; margin: 0; background: transparent; opacity: 0.7;">
                 ⚙️
             </button>
         `;
-        card.onclick = () => {
-            currentGroupId = id;
-            currentPeerId = null;
-            document.getElementById('active-peer-name').textContent = g.name;
-            document.getElementById('active-peer-status').textContent = 'Secure Nexus Network';
-
-            updateBeamTarget();
-            updateSidebar();
-            renderMessages();
-        };
-        list.appendChild(card);
     });
 }
 
@@ -1962,11 +2484,9 @@ function renderMessages() {
     const container = document.getElementById('messages-container');
     container.innerHTML = '';
 
-    // Messaging state feedback
     const input = document.getElementById('message-input');
     const sendBtn = document.getElementById('send-btn');
 
-    // Safety check: ensure input is enabled
     input.disabled = false;
     input.removeAttribute('disabled');
     sendBtn.disabled = false;
@@ -1974,22 +2494,18 @@ function renderMessages() {
 
     if (!currentPeerId && !currentGroupId) {
         input.placeholder = 'Select a node to begin...';
+        return;
     } else {
         input.placeholder = 'Type an encrypted message...';
     }
 
-    if (!peer || !peer.id) return; // Prevent filter errors during setup
+    const targetId = currentGroupId || currentPeerId;
+    const history = messageStore.get(targetId) || [];
 
-    const filtered = messages.filter(m => {
-        if (currentGroupId) return m.groupId === currentGroupId;
-        return (m.from === currentPeerId && m.to === peer.id && !m.groupId) || (m.from === peer.id && m.to === currentPeerId && !m.groupId);
-    });
-
-    filtered.forEach(m => {
+    history.forEach(m => {
         const div = document.createElement('div');
         div.className = `message ${m.type}`;
 
-        // Get display name for received group messages
         let fromDisplayName = m.from;
         if (m.type === 'received') {
             const p = activePeers.get(m.from);
@@ -1997,7 +2513,7 @@ function renderMessages() {
         }
 
         div.innerHTML = `
-            ${currentGroupId && m.type === 'received' ? `<small style="color: var(--accent-cyan); display: block; margin-bottom: 5px;">${fromDisplayName}</small>` : ''}
+            ${m.groupId && m.type === 'received' ? `<small style="color: var(--accent-cyan); display: block; margin-bottom: 5px;">${fromDisplayName}</small>` : ''}
             <div class="text">${escapeHtml(m.text)}</div>
             <small style="font-size: 0.7rem; opacity: 0.5; display: block; margin-top: 5px;">${m.time}</small>
         `;

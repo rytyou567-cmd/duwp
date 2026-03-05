@@ -5,15 +5,55 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nexus Neural Call</title>
+    <link rel="icon" href="data:;base64,iVBORw0KGgo=">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="call.css">
+    <script>
+        // High-performance log redirection (PortalLog)
+        // Must be in head for immediate cross-context availability
+        window.NexusPortalLog = (prefix, msg, type = 'info') => {
+            const styles = {
+                CALL: 'color: #00f2ff; font-weight: bold;',
+                SIGNAL: 'color: #a855f7; font-weight: bold;',
+                MEDIA: 'color: #10b981; font-weight: bold;',
+                UI: 'color: #ffaa00; font-weight: bold;',
+                GROUP: 'color: #4ade80; font-weight: bold;'
+            };
+            const typeStyles = {
+                error: 'color: #ff3b3b; font-weight: bold;',
+                warn: 'color: #ffaa00; font-weight: bold;',
+                info: 'color: #00f2ff;'
+            };
+
+            const prefixStyle = styles[prefix] || 'color: #00f2ff;';
+            const msgStyle = typeStyles[type] || 'color: inherit;';
+
+            console.log(`%c[${prefix}-PORTAL] %c${msg}`, prefixStyle, msgStyle);
+        };
+    </script>
 </head>
 
 <body>
     <div class="call-overlay">
-        <h2 id="call-status">Connecting Neural Link...</h2>
-        <div class="video-grid" id="video-grid">
-            <video id="local-video" autoplay muted playsinline></video>
+        <div class="call-header">
+            <h2 id="call-status">Connecting Neural Link...</h2>
+            <div id="security-badge" class="security-badge" title="End-to-End Encrypted">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                </svg>
+                <span id="fingerprint-display">SECURE</span>
+            </div>
+        </div>
+        <div class="main-container">
+            <div id="main-stage" class="main-stage">
+                <!-- Primary remote stream (video or screen) goes here -->
+            </div>
+            <div id="side-panel" class="side-panel">
+                <video id="local-video" autoplay muted playsinline></video>
+                <!-- Avatars and thumbnails go here -->
+            </div>
         </div>
         <div class="call-controls">
             <!-- Screen Share -->
@@ -36,14 +76,18 @@
             </button>
 
             <!-- Mute Toggle -->
-            <button class="call-btn" id="mute-btn" title="Mute Microphone">
-                <svg id="mic-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24"
-                    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                    <line x1="12" y1="19" x2="12" y2="22"></line>
-                </svg>
-            </button>
+            <div class="btn-wrap">
+                <canvas id="volume-visualizer" class="volume-visualizer"></canvas>
+                <button class="call-btn" id="mute-btn" title="Mute Microphone">
+                    <svg id="mic-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24"
+                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="22"></line>
+                    </svg>
+                </button>
+            </div>
 
             <!-- End Call -->
             <button class="call-btn end" id="end-call-btn" title="End Call">
@@ -60,38 +104,65 @@
         style="position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 10px; z-index: 5000;">
     </div>
 
+    <!-- Permission Denied Overlay -->
+    <div id="permission-overlay" class="permission-overlay hidden">
+        <div class="permission-card">
+            <div class="icon-pulse">
+                <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none"
+                    stroke="#ff4d4d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z">
+                    </path>
+                    <line x1="12" y1="9" x2="12" y2="13"></line>
+                    <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                </svg>
+            </div>
+            <h3>Media Access Blocked</h3>
+            <p id="permission-msg">Your browser or system is blocking access to your Camera/Microphone.</p>
+
+            <div class="guide-steps">
+                <div class="step">
+                    <strong>1. Check Browser Bar:</strong> Look for a camera/mic icon with a red 'X' in your address bar
+                    and click it to "Allow".
+                </div>
+                <div class="step">
+                    <strong>2. System Settings:</strong> Ensure another app (Zoom, Teams, etc.) isn't already using your
+                    camera.
+                </div>
+                <div class="step">
+                    <strong>3. Reload:</strong> If you've granted permission, please reload this page to retry.
+                </div>
+            </div>
+
+            <button class="call-btn" style="width: 100%; margin-top: 20px;" onclick="location.reload()">Retry
+                Connection</button>
+        </div>
+    </div>
+
+    <script src="call.js"></script>
     <script>
-        window.onload = () => {
-            if (window.opener && window.opener.onCallWindowLoaded) {
-                window.opener.onCallWindowLoaded(window);
+        // This ensures logs are executed in the Call Window's own console context.
+        window.addEventListener('load', () => {
+            console.log('[DEBUG] Call Window OnLoad Event Triggered');
+            if (typeof window.NexusPortalLog === 'function') {
+                window.NexusPortalLog('UI', 'Call Window DOM Fully Loaded', 'info');
             }
-        };
+            if (window.opener && typeof window.opener.onCallWindowLoaded === 'function') {
+                try {
+                    window.opener.onCallWindowLoaded(window);
+                    console.log('[DEBUG] onCallWindowLoaded executed on opener. Sending UI_READY.');
+                    window.opener.postMessage({ type: 'UI_READY' }, '*');
+                } catch (e) {
+                    console.warn('[DEBUG] Failed to call onCallWindowLoaded on opener:', e);
+                }
+            } else {
+                console.warn('[DEBUG] Opener not found or onCallWindowLoaded not a function.');
+                if (window.opener) window.opener.postMessage({ type: 'UI_READY' }, '*');
+            }
+        });
         window.onbeforeunload = () => {
             if (window.opener && window.opener.onCallWindowClosed) {
                 window.opener.onCallWindowClosed();
             }
-        };
-
-        // Simple isolated toast logic for the popup
-        window.showToast = function (msg, type = 'info') {
-            const container = document.getElementById('toast-container');
-            if (!container) return;
-            const toast = document.createElement('div');
-            toast.className = `toast ${type}`;
-            toast.textContent = msg;
-            toast.style.background = type === 'error' ? 'rgba(255, 59, 59, 0.9)' : (type === 'warning' ? 'rgba(255, 170, 0, 0.9)' : 'rgba(0, 242, 255, 0.9)');
-            toast.style.color = 'white';
-            toast.style.padding = '12px 20px';
-            toast.style.borderRadius = '8px';
-            toast.style.fontFamily = "'Outfit', sans-serif";
-            toast.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
-            toast.style.animation = 'slideIn 0.3s ease-out forwards';
-            container.appendChild(toast);
-            setTimeout(() => {
-                toast.style.opacity = '0';
-                toast.style.transition = 'opacity 0.5s';
-                setTimeout(() => toast.remove(), 500);
-            }, 4000);
         };
     </script>
 </body>
